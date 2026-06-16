@@ -25,28 +25,72 @@ function evaluateBernsteinStable(points: Point[], t: number): Point {
   if (n < 0) return createPoint(0, 0);
   if (n === 0) return { ...points[0] };
 
-  const oneMinusT = 1 - t;
+  if (t <= 0) return { ...points[0] };
+  if (t >= 1) return { ...points[n] };
 
-  let bc = 1;
-  let powT = 1;
-  let powOneMinusT = Math.pow(oneMinusT, n);
+  if (n <= 500) {
+    let pts = points.slice();
+    for (let r = 1; r <= n; r++) {
+      for (let i = 0; i <= n - r; i++) {
+        pts[i] = {
+          x: (1 - t) * pts[i].x + t * pts[i + 1].x,
+          y: (1 - t) * pts[i].y + t * pts[i + 1].y
+        };
+      }
+    }
+    return createPoint(
+      Number.isFinite(pts[0].x) ? pts[0].x : points[n].x,
+      Number.isFinite(pts[0].y) ? pts[0].y : points[n].y
+    );
+  }
 
-  let x = points[0].x * bc * powT * powOneMinusT;
-  let y = points[0].y * bc * powT * powOneMinusT;
+  const logT = Math.log(t);
+  const logOneMinusT = Math.log(1 - t);
 
+  const logBasis: number[] = new Array(n + 1);
+  let logBC = 0;
   for (let i = 1; i <= n; i++) {
-    powT *= t;
-    powOneMinusT = Math.max(0, powOneMinusT / oneMinusT) || 0;
-    bc = bc * (n - i + 1) / i;
-    const basis = bc * powT * powOneMinusT;
-    if (!Number.isFinite(basis)) continue;
-    x += points[i].x * basis;
-    y += points[i].y * basis;
+    logBC += Math.log(n - i + 1) - Math.log(i);
+  }
+  let maxLogBasis = -Infinity;
+  for (let i = 0; i <= n; i++) {
+    let lb = 0;
+    if (i === 0) {
+      lb = n * logOneMinusT;
+    } else if (i === n) {
+      lb = n * logT;
+    } else {
+      let lbc = 0;
+      for (let k = 1; k <= i; k++) {
+        lbc += Math.log(n - k + 1) - Math.log(k);
+      }
+      lb = lbc + i * logT + (n - i) * logOneMinusT;
+    }
+    logBasis[i] = lb;
+    if (lb > maxLogBasis) maxLogBasis = lb;
+  }
+
+  const weights: number[] = new Array(n + 1);
+  let sumWeights = 0;
+  for (let i = 0; i <= n; i++) {
+    const w = Math.exp(logBasis[i] - maxLogBasis);
+    weights[i] = Number.isFinite(w) ? w : 0;
+    sumWeights += weights[i];
+  }
+
+  if (sumWeights < 1e-300) {
+    return { ...points[n] };
+  }
+
+  let x = 0, y = 0;
+  for (let i = 0; i <= n; i++) {
+    x += points[i].x * weights[i];
+    y += points[i].y * weights[i];
   }
 
   return createPoint(
-    Number.isFinite(x) ? x : 0,
-    Number.isFinite(y) ? y : 0
+    Number.isFinite(x) ? x / sumWeights : points[n].x,
+    Number.isFinite(y) ? y / sumWeights : points[n].y
   );
 }
 
@@ -106,7 +150,9 @@ export class BezierCurve implements Curve {
 
   evaluate(t: number): Point {
     t = clamp(t, 0, 1);
-    if (this.degree <= 50) {
+    if (t <= 0) return { ...this.controlPoints[0] };
+    if (t >= 1) return { ...this.controlPoints[this.degree] };
+    if (this.degree <= 200) {
       return this.deCasteljauIterative(this.controlPoints, t);
     }
     return safePoint(evaluateBernsteinStable(this.controlPoints, t));

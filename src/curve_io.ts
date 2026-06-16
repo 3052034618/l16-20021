@@ -52,6 +52,20 @@ export class CurveIO {
       return this.bezierSegmentsToSVG(segments, options);
     }
 
+    if (c instanceof BezierCurve) {
+      const cps = c.getControlPoints();
+      const deg = cps.length - 1;
+      if (deg === 1) {
+        return this.pointsToSVGPath(cps, options);
+      } else if (deg === 2) {
+        const fmt = (n: number) => Number(n.toFixed(digits)).toString();
+        return `M ${fmt(cps[0].x)} ${fmt(cps[0].y)} Q ${fmt(cps[1].x)} ${fmt(cps[1].y)}, ${fmt(cps[2].x)} ${fmt(cps[2].y)}`;
+      } else if (deg === 3) {
+        const fmt = (n: number) => Number(n.toFixed(digits)).toString();
+        return `M ${fmt(cps[0].x)} ${fmt(cps[0].y)} C ${fmt(cps[1].x)} ${fmt(cps[1].y)}, ${fmt(cps[2].x)} ${fmt(cps[2].y)}, ${fmt(cps[3].x)} ${fmt(cps[3].y)}`;
+      }
+    }
+
     const samples = c.sample(100);
     return this.pointsToSVGPath(samples, options);
   }
@@ -150,12 +164,7 @@ export class CurveIO {
     let svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`;
     svg += `<g stroke="${stroke}" stroke-width="${strokeWidth}" fill="none">`;
 
-    const transformed = path.replace(/([MLQC])\s+(-?[\d.]+)\s+(-?[\d.]+)/g,
-      (_m, cmd, x, y) => {
-        const tx = (parseFloat(x) * scale + offsetX).toFixed(2);
-        const ty = (-parseFloat(y) * scale + offsetY).toFixed(2);
-        return `${cmd} ${tx} ${ty}`;
-      }).replace(/C\s+(-?[\d.]+)\s+(-?[\d.]+),\s*(-?[\d.]+)\s+(-?[\d.]+),\s*(-?[\d.]+)\s+(-?[\d.]+)/g,
+    const transformed = path.replace(/C\s+(-?[\d.]+)\s+(-?[\d.]+),\s*(-?[\d.]+)\s+(-?[\d.]+),\s*(-?[\d.]+)\s+(-?[\d.]+)/g,
         (_m, x1, y1, x2, y2, x, y) => {
           const px1 = (parseFloat(x1) * scale + offsetX).toFixed(2);
           const py1 = (-parseFloat(y1) * scale + offsetY).toFixed(2);
@@ -164,7 +173,12 @@ export class CurveIO {
           const px = (parseFloat(x) * scale + offsetX).toFixed(2);
           const py = (-parseFloat(y) * scale + offsetY).toFixed(2);
           return `C ${px1} ${py1}, ${px2} ${py2}, ${px} ${py}`;
-        });
+        }).replace(/([MLQ])\s+(-?[\d.]+)\s+(-?[\d.]+)/g,
+      (_m, cmd, x, y) => {
+        const tx = (parseFloat(x) * scale + offsetX).toFixed(2);
+        const ty = (-parseFloat(y) * scale + offsetY).toFixed(2);
+        return `${cmd} ${tx} ${ty}`;
+      });
 
     svg += `<path d="${transformed}"/>`;
     svg += `</g>`;

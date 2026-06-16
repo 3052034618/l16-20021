@@ -1,6 +1,6 @@
 import {
   Point, createPoint, LinearInterpolation, CubicSpline,
-  BezierCurve, CubicBezier, CatmullRomSpline, solveTridiagonal,
+  BezierCurve, CubicBezier, CatmullRomSpline, CompositeBezierCurve, solveTridiagonal,
   verifyTridiagonalSolution, bernsteinPolynomial, binomialCoefficient,
   ArcLengthSampler, distance, CurveAnalyzer, CurveIO, cleanInputPoints,
   computeBoundingBox, isFinitePoint, autoKnots, bboxContainsPoint
@@ -575,6 +575,196 @@ testSection('测试 15: 大量控制点性能 / 稳定性', () => {
   assert(buildCR < 5000, `CatmullRom(${CR_N}点) 构建<5s, 实际=${buildCR}ms`);
   const crMid = crBig.evaluate(0.5);
   assert(Number.isFinite(crMid.x) && Number.isFinite(crMid.y), 'CR 中点求值有限');
+});
+
+testSection('测试 16: SVG 导出坐标变换一致性', () => {
+  const p0 = createPoint(10, 20);
+  const p1 = createPoint(50, 100);
+  const p2 = createPoint(150, 80);
+  const p3 = createPoint(200, 200);
+  const cubicBz = new CubicBezier(p0, p1, p2, p3);
+
+  const pathStr = CurveIO.toSVGPath(cubicBz, { digits: 2 });
+  assert(pathStr.startsWith('M 10 20'), 'SVG path 起点正确');
+  assert(pathStr.includes('C 50 100, 150 80, 200 200'), '三次贝塞尔 C 指令控制点正确');
+  console.log(`  → C 指令: ${pathStr}`);
+
+  const fullSVG = CurveIO.curveToFullSVG(cubicBz, {
+    width: 500, height: 300, padding: 20,
+    stroke: '#3366ff', strokeWidth: 2
+  });
+
+  const fullSVG2 = CurveIO.curveToFullSVG(new CompositeBezierCurve([cubicBz]), {
+    width: 500, height: 300, padding: 20,
+    stroke: '#3366ff', strokeWidth: 2
+  });
+
+  const path1 = fullSVG.match(/d="([^"]+)"/)?.[1] || '';
+  const path2 = fullSVG2.match(/d="([^"]+)"/)?.[1] || '';
+  assert(path1 === path2, '单个CubicBezier与CompositeBezier导出的变换后path一致');
+
+  const ptsMatch = fullSVG.match(/<circle cx="([\d.]+)" cy="([\d.]+)"/g);
+  const controlPointCount = ptsMatch ? ptsMatch.length : 0;
+  assert(controlPointCount === 4, `SVG 中显示了全部 4 个控制点 (实际: ${controlPointCount})`);
+
+  const scaleX = 460 / 190;
+  const scaleY = 260 / 180;
+  const scale = Math.min(scaleX, scaleY);
+  const offsetX = 20 - 10 * scale;
+  const offsetY = 20 + 200 * scale;
+  const tp1x = (50 * scale + offsetX).toFixed(2);
+  const tp1y = (-100 * scale + offsetY).toFixed(2);
+  assert(path1.includes(`${tp1x} ${tp1y}`), `变换后控制点 P1 位置正确 (${tp1x},${tp1y})`);
+  assert(fullSVG.includes(`cx="${tp1x}" cy="${tp1y}"`), '控制点 marker 与 path 使用相同变换');
+
+  const svgPts = (ptsMatch || []).map(m => {
+    const mm = m.match(/cx="([\d.]+)" cy="([\d.]+)"/);
+    return { x: parseFloat(mm![1]), y: parseFloat(mm![2]) };
+  });
+  const tP0x = (10 * scale + offsetX).toFixed(2);
+  const tP3x = (200 * scale + offsetX).toFixed(2);
+  const tP0y = (-20 * scale + offsetY).toFixed(2);
+  const tP3y = (-200 * scale + offsetY).toFixed(2);
+  assert(Math.abs(svgPts[0].x - parseFloat(tP0x)) < 0.01, '起点 marker 与计算一致');
+  assert(Math.abs(svgPts[3].x - parseFloat(tP3x)) < 0.01, '终点 marker 与计算一致');
+  assert(Math.abs(svgPts[0].y - parseFloat(tP0y)) < 0.01, '起点 marker Y 与计算一致');
+  assert(Math.abs(svgPts[3].y - parseFloat(tP3y)) < 0.01, '终点 marker Y 与计算一致');
+
+  const qbz = new BezierCurve([createPoint(0, 0), createPoint(50, 100), createPoint(100, 0)]);
+  const qPath = CurveIO.toSVGPath(qbz, { digits: 2 });
+  assert(qPath.startsWith('M 0 0'), '二次贝塞尔起点正确');
+  assert(qPath.includes('Q 50 100, 100 0'), '二次贝塞尔 Q 指令正确');
+
+  const lbz = new BezierCurve([createPoint(10, 20), createPoint(50, 60)]);
+  const lPath = CurveIO.toSVGPath(lbz, { digits: 2 });
+  assert(lPath.startsWith('M 10 20'), '一次贝塞尔起点正确');
+  assert(lPath.includes('L 50 60'), '一次贝塞尔 L 指令正确');
+});
+
+testSection('测试 17: 高阶贝塞尔端点稳定性', () => {
+  const Ns = [10, 50, 100, 200, 500, 1000];
+  for (const N of Ns) {
+    const pts: Point[] = [];
+    for (let i = 0; i <= N; i++) {
+      const angle = (i / N) * Math.PI * 2;
+      pts.push(createPoint(Math.cos(angle) * 100, Math.sin(angle) * 100));
+    }
+    const bz = new BezierCurve(pts);
+
+    const p0 = bz.evaluate(0);
+    assertPointApprox(p0, pts[0], 1e-9, `degree=${N} evaluate(0) == 起点`);
+    assert(Math.abs(p0.x - pts[0].x) < 1e-10, `evaluate(0).x 不跳变`);
+    assert(Math.abs(p0.y - pts[0].y) < 1e-10, `evaluate(0).y 不跳变`);
+
+    const p1 = bz.evaluate(1);
+    assertPointApprox(p1, pts[N], 1e-9, `degree=${N} evaluate(1) == 终点`);
+    assert(Math.abs(p1.x - pts[N].x) < 1e-10, `evaluate(1).x 不跳变`);
+    assert(Math.abs(p1.y - pts[N].y) < 1e-10, `evaluate(1).y 不跳变`);
+
+    let hasNaN = false, hasZeroJump = false;
+    for (let i = 0; i <= 50; i++) {
+      const t = i / 50;
+      const p = bz.evaluate(t);
+      if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) {
+        hasNaN = true;
+      }
+      if (t > 0 && t < 1 && Math.abs(p.x) < 1e-10 && Math.abs(p.y) < 1e-10 && pts[0].x !== 0) {
+        hasZeroJump = true;
+      }
+    }
+    assert(!hasNaN, `degree=${N} 无 NaN 采样点`);
+    assert(!hasZeroJump, `degree=${N} 无跳变到 (0,0)`);
+
+    const t05 = bz.evaluate(0.5);
+    assert(Number.isFinite(t05.x) && Number.isFinite(t05.y), `degree=${N} t=0.5 有限`);
+
+    const d0 = bz.derivative(0);
+    const d1 = bz.derivative(1);
+    assert(Number.isFinite(d0.x) && Number.isFinite(d0.y), `degree=${N} derivative(0) 有限`);
+    assert(Number.isFinite(d1.x) && Number.isFinite(d1.y), `degree=${N} derivative(1) 有限`);
+
+    const an = bz.getAnalyzer();
+    const sp = an.speedProfile(50);
+    const allFinite = sp.every(p => Number.isFinite(p.speed));
+    assert(allFinite, `degree=${N} speedProfile 全部有限`);
+    const speedAtEnd = sp[sp.length - 1].speed;
+    const derivMag = Math.sqrt(d1.x ** 2 + d1.y ** 2);
+    assertApprox(speedAtEnd, derivMag, 1e-6, `degree=${N} 末端 speedProfile 与 derivative(1) 一致`);
+  }
+});
+
+testSection('测试 18: sample 末端与 evaluate(1) 一致性', () => {
+  const pts: Point[] = [];
+  for (let i = 0; i <= 500; i++) {
+    pts.push(createPoint(i, Math.sin(i * 0.1) * 50 + i * 0.5));
+  }
+
+  const cr = new CatmullRomSpline(pts, {
+    timeStamps: pts.map((_, i) => i * 0.1),
+    tension: 0.5,
+    closed: false
+  });
+
+  const bzHigh = new BezierCurve(pts.slice(0, 200));
+
+  const testCurves = [
+    { name: 'Linear(1000)', c: new LinearInterpolation(pts) },
+    { name: 'CubicSpline(1000)', c: new CubicSpline(pts) },
+    { name: 'CatmullRom(1000)', c: cr },
+    { name: 'Bezier(degree=199)', c: bzHigh }
+  ];
+
+  for (const { name, c } of testCurves) {
+    const samples = c.sample(200);
+    const lastSample = samples[samples.length - 1];
+    const eval1 = c.evaluate(1);
+    assertPointApprox(lastSample, eval1, 1e-9, `${name} sample() 最后一点 == evaluate(1)`);
+
+    const arcSamples = c.sampleByArcLength(200);
+    const lastArc = arcSamples[arcSamples.length - 1];
+    assertPointApprox(lastArc, eval1, 1e-6, `${name} sampleByArcLength() 最后一点 == evaluate(1)`);
+
+    const totalLen = c.getTotalLength();
+    const cAny = c as any;
+    const evalByArc = cAny.getArcLengthSampler
+      ? cAny.getArcLengthSampler().evaluateByArcLength(totalLen)
+      : cAny.evaluateByArcLength
+        ? cAny.evaluateByArcLength(totalLen)
+        : eval1;
+    assertPointApprox(evalByArc, eval1, 1e-6, `${name} evaluateByArcLength(total) == evaluate(1)`);
+
+    const derivAt1 = c.derivative(1);
+    const analyzer = c.getAnalyzer();
+    const sp = analyzer.speedProfile(200);
+    const endSpeed = sp[sp.length - 1].speed;
+    const derivMag = Math.sqrt(derivAt1.x ** 2 + derivAt1.y ** 2);
+    assertApprox(endSpeed, derivMag, 1e-6, `${name} 末端 speed 与 derivative(1) 一致`);
+
+    const curvatures = analyzer.speedProfile(50);
+    const lastCurv = curvatures[curvatures.length - 1];
+    assert(
+      lastCurv.curvature === undefined || Number.isFinite(lastCurv.curvature),
+      `${name} 末端曲率有限`
+    );
+
+    const firstSample = samples[0];
+    const eval0 = c.evaluate(0);
+    assertPointApprox(firstSample, eval0, 1e-9, `${name} sample() 第一点 == evaluate(0)`);
+
+    const arcFirst = arcSamples[0];
+    assertPointApprox(arcFirst, eval0, 1e-6, `${name} sampleByArcLength() 第一点 == evaluate(0)`);
+  }
+
+  const pts2: Point[] = [];
+  for (let i = 0; i <= 5000; i++) {
+    pts2.push(createPoint(i * 0.1, Math.cos(i * 0.05) * 30 + Math.sin(i * 0.02) * 20));
+  }
+  const cr5k = new CatmullRomSpline(pts2, { closed: false, tension: 0.5 });
+  const s5k = cr5k.sample(500);
+  const endPt = pts2[pts2.length - 1];
+  assertPointApprox(s5k[s5k.length - 1], cr5k.evaluate(1), 1e-9, 'CatmullRom(5000) sample 末端 == evaluate(1)');
+  assertPointApprox(cr5k.evaluate(0), pts2[0], 1e-9, 'CatmullRom(5000) evaluate(0) == 起点');
+  assertPointApprox(cr5k.evaluate(1), endPt, 1e-9, 'CatmullRom(5000) evaluate(1) == 终点');
 });
 
 console.log('\n' + '='.repeat(50));
