@@ -41,14 +41,33 @@ export class CubicSpline implements Curve {
 
     this.controlPoints = cleaned.points;
 
+    const nPts = this.controlPoints.length;
+    if (nPts >= 10000) {
+      console.warn(`[CubicSpline] ${nPts} control points is extremely high. Performance: building...`);
+    }
+
     this.setupKnots();
     this.buildSpline();
-    this.arcLengthSampler = new ArcLengthSampler((t) => this.evaluate(t), 2000);
+
+    let samplerRes = 2000;
+    let analyzerRes = 200;
+    if (nPts > 20000) {
+      samplerRes = 400;
+      analyzerRes = 40;
+    } else if (nPts > 5000) {
+      samplerRes = 600;
+      analyzerRes = 80;
+    } else if (nPts > 1000) {
+      samplerRes = 1000;
+      analyzerRes = 120;
+    }
+
+    this.arcLengthSampler = new ArcLengthSampler((t) => this.evaluate(t), samplerRes);
     this.totalLength = this.arcLengthSampler.getTotalLength();
     this.analyzer = new CurveAnalyzer(
       (t) => this.evaluate(t),
       (t) => this.derivative(t),
-      200
+      analyzerRes
     );
   }
 
@@ -307,9 +326,10 @@ export class CubicSpline implements Curve {
     if (count < 2) {
       throw new Error('Sample count must be at least 2');
     }
+    const n = Math.min(count, 100000);
     const result: Point[] = [];
-    for (let i = 0; i < count; i++) {
-      const t = i / (count - 1);
+    for (let i = 0; i < n; i++) {
+      const t = i / (n - 1);
       result.push(this.evaluate(t));
     }
     return result;

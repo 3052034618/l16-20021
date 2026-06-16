@@ -20,6 +20,36 @@ export function bernsteinPolynomial(n: number, i: number, t: number): number {
   return binomialCoefficient(n, i) * Math.pow(t, i) * Math.pow(1 - t, n - i);
 }
 
+function evaluateBernsteinStable(points: Point[], t: number): Point {
+  const n = points.length - 1;
+  if (n < 0) return createPoint(0, 0);
+  if (n === 0) return { ...points[0] };
+
+  const oneMinusT = 1 - t;
+
+  let bc = 1;
+  let powT = 1;
+  let powOneMinusT = Math.pow(oneMinusT, n);
+
+  let x = points[0].x * bc * powT * powOneMinusT;
+  let y = points[0].y * bc * powT * powOneMinusT;
+
+  for (let i = 1; i <= n; i++) {
+    powT *= t;
+    powOneMinusT = Math.max(0, powOneMinusT / oneMinusT) || 0;
+    bc = bc * (n - i + 1) / i;
+    const basis = bc * powT * powOneMinusT;
+    if (!Number.isFinite(basis)) continue;
+    x += points[i].x * basis;
+    y += points[i].y * basis;
+  }
+
+  return createPoint(
+    Number.isFinite(x) ? x : 0,
+    Number.isFinite(y) ? y : 0
+  );
+}
+
 export class BezierCurve implements Curve {
   private controlPoints: Point[];
   private degree: number;
@@ -33,11 +63,36 @@ export class BezierCurve implements Curve {
     }
     this.controlPoints = cleaned.points;
     this.degree = this.controlPoints.length - 1;
-    this.arcLengthSampler = new ArcLengthSampler((t) => this.evaluate(t), 2000);
+
+    if (this.degree >= 2000) {
+      console.warn(
+        `[BezierCurve] degree=${this.degree} is extremely high, performance may be limited. ` +
+        `Consider using CompositeBezierCurve or CubicSpline for many data points.`
+      );
+    } else if (this.degree >= 500) {
+      console.warn(
+        `[BezierCurve] degree=${this.degree} is high, consider using CompositeBezierCurve instead.`
+      );
+    }
+
+    let samplerRes = 2000;
+    let analyzerRes = 200;
+    if (this.degree > 2000) {
+      samplerRes = 200;
+      analyzerRes = 40;
+    } else if (this.degree > 500) {
+      samplerRes = 500;
+      analyzerRes = 60;
+    } else if (this.degree > 100) {
+      samplerRes = 1000;
+      analyzerRes = 100;
+    }
+
+    this.arcLengthSampler = new ArcLengthSampler((t) => this.evaluate(t), samplerRes);
     this.analyzer = new CurveAnalyzer(
       (t) => this.evaluate(t),
       (t) => this.derivative(t),
-      200
+      analyzerRes
     );
   }
 
@@ -51,7 +106,10 @@ export class BezierCurve implements Curve {
 
   evaluate(t: number): Point {
     t = clamp(t, 0, 1);
-    return this.deCasteljau(this.controlPoints, t);
+    if (this.degree <= 50) {
+      return this.deCasteljauIterative(this.controlPoints, t);
+    }
+    return safePoint(evaluateBernsteinStable(this.controlPoints, t));
   }
 
   private deCasteljau(points: Point[], t: number): Point {
@@ -74,32 +132,30 @@ export class BezierCurve implements Curve {
     let current = [...points];
     while (current.length > 1) {
       const next: Point[] = [];
-      for (let i = 0; i < current.length - 1; i++) {
+      const nCur = current.length;
+      for (let i = 0; i < nCur - 1; i++) {
         next.push(lerpPoint(current[i], current[i + 1], t));
       }
       current = next;
     }
-    return { ...current[0] };
+    return safePoint({ ...current[0] });
   }
 
   evaluateBernstein(t: number): Point {
     t = clamp(t, 0, 1);
-    const n = this.degree;
-    let x = 0, y = 0;
-    for (let i = 0; i <= n; i++) {
-      const b = bernsteinPolynomial(n, i, t);
-      x += this.controlPoints[i].x * b;
-      y += this.controlPoints[i].y * b;
-    }
-    return createPoint(x, y);
+    return safePoint(evaluateBernsteinStable(this.controlPoints, t));
   }
 
   getDeCasteljauTable(t: number): Point[][] {
     t = clamp(t, 0, 1);
+    if (this.degree > 100) {
+      console.warn(`[BezierCurve] getDeCasteljauTable degree=${this.degree} is high, table may be very large.`);
+    }
     const table: Point[][] = [];
     table.push([...this.controlPoints]);
 
-    for (let level = 1; level <= this.degree; level++) {
+    const maxLevels = Math.min(this.degree, 200);
+    for (let level = 1; level <= maxLevels; level++) {
       const prev = table[level - 1];
       const current: Point[] = [];
       for (let i = 0; i < prev.length - 1; i++) {
@@ -112,20 +168,27 @@ export class BezierCurve implements Curve {
 
   subdivide(t: number): BezierSubdivision {
     t = clamp(t, 0, 1);
+    if (this.degree > 100) {
+      console.warn(`[BezierCurve] subdivide with degree=${this.degree} may be slow, use adaptiveSubdivision instead.`);
+    }
     const table = this.getDeCasteljauTable(t);
     const left: Point[] = [];
     const right: Point[] = [];
 
-    for (let i = 0; i <= this.degree; i++) {
+    const n = Math.min(this.degree + 1, table.length);
+    for (let i = 0; i < n; i++) {
       left.push(table[i][0]);
     }
-    for (let i = 0; i <= this.degree; i++) {
-      right.push(table[this.degree - i][i]);
+    for (let i = 0; i < n; i++) {
+      right.push(table[n - 1 - i][i]);
     }
     return { left, right };
   }
 
   split(t: number): [BezierCurve, BezierCurve] {
+    if (this.degree > 100) {
+      throw new Error(`[BezierCurve] split not supported for degree=${this.degree}, use sampling instead.`);
+    }
     const { left, right } = this.subdivide(t);
     return [new BezierCurve(left), new BezierCurve(right)];
   }
@@ -138,17 +201,30 @@ export class BezierCurve implements Curve {
       return createPoint(dx, dy);
     }
 
-    const derivativePoints: Point[] = [];
-    const n = this.degree;
-    for (let i = 0; i < n; i++) {
-      derivativePoints.push({
-        x: n * (this.controlPoints[i + 1].x - this.controlPoints[i].x),
-        y: n * (this.controlPoints[i + 1].y - this.controlPoints[i].y)
-      });
+    if (this.degree <= 50) {
+      const derivativePoints: Point[] = [];
+      const n = this.degree;
+      for (let i = 0; i < n; i++) {
+        derivativePoints.push({
+          x: n * (this.controlPoints[i + 1].x - this.controlPoints[i].x),
+          y: n * (this.controlPoints[i + 1].y - this.controlPoints[i].y)
+        });
+      }
+      const dc = new BezierCurve(derivativePoints);
+      return dc.evaluate(t);
     }
 
-    const derivativeCurve = new BezierCurve(derivativePoints);
-    return derivativeCurve.evaluate(t);
+    const h = 1e-6;
+    const t1 = Math.max(0, t - h);
+    const t2 = Math.min(1, t + h);
+    const p1 = this.evaluate(t1);
+    const p2 = this.evaluate(t2);
+    const denom = t2 - t1;
+    if (denom < 1e-15) return createPoint(0, 0);
+    return safePoint({
+      x: (p2.x - p1.x) / denom,
+      y: (p2.y - p1.y) / denom
+    });
   }
 
   tangent(t: number): Point {
@@ -179,8 +255,17 @@ export class BezierCurve implements Curve {
   }
 
   adaptiveSubdivision(flatnessTolerance: number = 0.5, maxDepth: number = 10): Point[][] {
+    if (this.degree > 200) {
+      console.warn(`[BezierCurve] adaptiveSubdivision: degree=${this.degree}, falling back to sample-based subdivision.`);
+      const samples = this.sample(Math.max(10, Math.min(1000, this.degree / 2)));
+      const result: Point[][] = [];
+      for (let i = 0; i < samples.length - 1; i++) {
+        result.push([samples[i], samples[i + 1]]);
+      }
+      return result;
+    }
     const segments: Point[][] = [];
-    this.adaptiveSubdivideRecursive(this.controlPoints, segments, flatnessTolerance, 0, maxDepth);
+    this.adaptiveSubdivideRecursive(this.controlPoints, segments, flatnessTolerance, 0, Math.min(maxDepth, 15));
     return segments;
   }
 
@@ -235,9 +320,10 @@ export class BezierCurve implements Curve {
     if (count < 2) {
       throw new Error('Sample count must be at least 2');
     }
+    const n = Math.min(count, 100000);
     const result: Point[] = [];
-    for (let i = 0; i < count; i++) {
-      const t = i / (count - 1);
+    for (let i = 0; i < n; i++) {
+      const t = i / (n - 1);
       result.push(this.evaluate(t));
     }
     return result;
@@ -292,12 +378,31 @@ export class CompositeBezierCurve implements Curve {
       total += 1;
       this.segmentStartParams.push(total);
     }
-    this.arcLengthSampler = new ArcLengthSampler((t) => this.evaluate(t), 3000);
+
+    const nCurves = this.curves.length;
+    if (nCurves >= 2000) {
+      console.warn(`[CompositeBezierCurve] ${nCurves} segments, performance protection enabled.`);
+    }
+
+    let samplerRes = 3000;
+    let analyzerRes = 200;
+    if (nCurves > 10000) {
+      samplerRes = 500;
+      analyzerRes = 40;
+    } else if (nCurves > 2000) {
+      samplerRes = 1000;
+      analyzerRes = 80;
+    } else if (nCurves > 500) {
+      samplerRes = 2000;
+      analyzerRes = 120;
+    }
+
+    this.arcLengthSampler = new ArcLengthSampler((t) => this.evaluate(t), samplerRes);
     this.totalLength = this.arcLengthSampler.getTotalLength();
     this.analyzer = new CurveAnalyzer(
       (t) => this.evaluate(t),
       (t) => this.derivative(t),
-      200
+      analyzerRes
     );
   }
 
@@ -325,9 +430,10 @@ export class CompositeBezierCurve implements Curve {
     if (count < 2) {
       throw new Error('Sample count must be at least 2');
     }
+    const n = Math.min(count, 100000);
     const result: Point[] = [];
-    for (let i = 0; i < count; i++) {
-      const t = i / (count - 1);
+    for (let i = 0; i < n; i++) {
+      const t = i / (n - 1);
       result.push(this.evaluate(t));
     }
     return result;

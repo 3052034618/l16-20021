@@ -18,17 +18,29 @@ export class LinearInterpolation implements Curve {
     this.points = cleaned.points;
     this.segmentLengths = this.computeSegmentLengths();
     this.totalLength = this.segmentLengths.reduce((a, b) => a + b, 0);
-    this.arcLengthSampler = new ArcLengthSampler((t) => this.evaluate(t), 1000);
+
+    const nPts = this.points.length;
+    let samplerRes = 1000;
+    let analyzerRes = 200;
+    if (nPts > 50000) {
+      samplerRes = 500;
+      analyzerRes = 50;
+    } else if (nPts > 10000) {
+      samplerRes = 800;
+      analyzerRes = 100;
+    }
+    this.arcLengthSampler = new ArcLengthSampler((t) => this.evaluate(t), samplerRes);
     this.analyzer = new CurveAnalyzer(
       (t) => this.evaluate(t),
       (t) => this.derivative(t),
-      200
+      analyzerRes
     );
   }
 
   private computeSegmentLengths(): number[] {
     const lengths: number[] = [];
-    for (let i = 0; i < this.points.length - 1; i++) {
+    const n = Math.min(this.points.length - 1, 100000);
+    for (let i = 0; i < n; i++) {
       lengths.push(distance(this.points[i], this.points[i + 1]));
     }
     return lengths;
@@ -63,9 +75,10 @@ export class LinearInterpolation implements Curve {
     if (count < 2) {
       throw new Error('Sample count must be at least 2');
     }
+    const n = Math.min(count, 100000);
     const result: Point[] = [];
-    for (let i = 0; i < count; i++) {
-      const t = i / (count - 1);
+    for (let i = 0; i < n; i++) {
+      const t = i / (n - 1);
       result.push(this.evaluate(t));
     }
     return result;

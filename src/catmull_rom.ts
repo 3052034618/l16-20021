@@ -16,6 +16,16 @@ export interface CatmullRomOptions {
   timeStamps?: number[];
 }
 
+interface CRSegment {
+  a: Point;
+  b: Point;
+  c: Point;
+  d: Point;
+  knotStart: number;
+  knotEnd: number;
+  span: number;
+}
+
 export class CatmullRomSpline implements Curve {
   private controlPoints: Point[];
   private tension: number;
@@ -25,6 +35,7 @@ export class CatmullRomSpline implements Curve {
   private closed: boolean;
   private knots: number[] = [];
   private options: CatmullRomOptions;
+  private segments: CRSegment[] = [];
 
   constructor(points: Point[], options: CatmullRomOptions = {}) {
     this.options = { ...options };
@@ -43,13 +54,16 @@ export class CatmullRomSpline implements Curve {
     }
 
     this.setupKnots();
+    this.buildSegments();
 
-    this.arcLengthSampler = new ArcLengthSampler((t) => this.evaluate(t), 2000);
+    const nPts = this.controlPoints.length;
+    const samplerRes = nPts > 2000 ? 400 : nPts > 500 ? 800 : 2000;
+    this.arcLengthSampler = new ArcLengthSampler((t) => this.evaluate(t), samplerRes);
     this.totalLength = this.arcLengthSampler.getTotalLength();
     this.analyzer = new CurveAnalyzer(
       (t) => this.evaluate(t),
       (t) => this.derivative(t),
-      200
+      nPts > 2000 ? 50 : nPts > 500 ? 100 : 200
     );
   }
 
@@ -138,8 +152,110 @@ export class CatmullRomSpline implements Curve {
     }
   }
 
+  private getKnot(index: number): number {
+    const n = this.knots.length;
+    if (this.closed) {
+      if (index < 0) return this.knots[index + n] - 1;
+      if (index >= n) return this.knots[index - n] + 1;
+      return this.knots[index];
+    } else {
+      if (index < 0) {
+        const h = this.knots[1] - this.knots[0];
+        return this.knots[0] - h;
+      }
+      if (index >= n) {
+        const h = this.knots[n - 1] - this.knots[n - 2];
+        return this.knots[n - 1] + h;
+      }
+      return this.knots[index];
+    }
+  }
+
   private getSegmentCount(): number {
     return this.closed ? this.controlPoints.length : this.controlPoints.length - 1;
+  }
+
+  private computeTangent(
+    pPrev: Point, pCurr: Point, pNext: Point,
+    hPrev: number, hCurr: number
+  ): Point {
+    const hp = hPrev < STABILITY_EPSILON ? STABILITY_EPSILON : hPrev;
+    const hc = hCurr < STABILITY_EPSILON ? STABILITY_EPSILON : hCurr;
+    const denom = hp + hc;
+
+    if (denom < STABILITY_EPSILON) {
+      return createPoint(0, 0);
+    }
+
+    const term1 = scalePoint(subPoints(pCurr, pPrev), hc / (hp * denom));
+    const term2 = scalePoint(subPoints(pNext, pCurr), hp / (hc * denom));
+
+    return addPoints(term1, term2);
+  }
+
+  private buildSegments(): void {
+    this.segments = [];
+    const n = this.getSegmentCount();
+    const nPts = this.controlPoints.length;
+    const alpha = this.tension;
+
+    for (let i = 0; i < n; i++) {
+      let p0Idx: number, p1Idx: number, p2Idx: number, p3Idx: number;
+
+      if (this.closed) {
+        p0Idx = (i - 1 + nPts) % nPts;
+        p1Idx = i;
+        p2Idx = (i + 1) % nPts;
+        p3Idx = (i + 2) % nPts;
+      } else {
+        p0Idx = i - 1;
+        p1Idx = i;
+        p2Idx = i + 1;
+        p3Idx = i + 2;
+      }
+
+      const p0 = this.getPoint(p0Idx);
+      const p1 = this.controlPoints[this.closed ? p1Idx : clamp(p1Idx, 0, nPts - 1)];
+      const p2 = this.controlPoints[this.closed ? p2Idx : clamp(p2Idx, 0, nPts - 1)];
+      const p3 = this.getPoint(p3Idx);
+
+      const knotStart = this.knots[i] ?? 0;
+      const knotEnd = this.knots[i + 1] ?? 1;
+      let hi = knotEnd - knotStart;
+      if (hi < STABILITY_EPSILON) hi = STABILITY_EPSILON;
+
+      const hPrev = this.getKnot(i) - this.getKnot(i - 1);
+      const hNext = this.getKnot(i + 2) - this.getKnot(i + 1);
+
+      const mCurr = this.computeTangent(p0, p1, p2, hPrev, hi);
+      const mNext = this.computeTangent(p1, p2, p3, hi, hNext);
+
+      const deltaP = subPoints(p2, p1);
+
+      const a = { ...p1 };
+      const b = scalePoint(mCurr, alpha * hi);
+      const c = subPoints(
+        scalePoint(deltaP, 3),
+        addPoints(
+          scalePoint(mCurr, alpha * hi * 2),
+          scalePoint(mNext, alpha * hi)
+        )
+      );
+      const d = addPoints(
+        scalePoint(deltaP, -2),
+        addPoints(
+          scalePoint(mCurr, alpha * hi),
+          scalePoint(mNext, alpha * hi)
+        )
+      );
+
+      this.segments.push({
+        a, b, c, d,
+        knotStart,
+        knotEnd,
+        span: hi
+      });
+    }
   }
 
   private findSegment(t: number): { segmentIndex: number; localT: number } {
@@ -162,9 +278,9 @@ export class CatmullRomSpline implements Curve {
     }
 
     const idx = lo;
-    const kStart = this.knots[idx] ?? 0;
-    const kEnd = this.knots[idx + 1] ?? 1;
-    const span = kEnd - kStart;
+    const seg = this.segments[idx];
+    const span = seg?.span ?? 1;
+    const kStart = seg?.knotStart ?? 0;
     const localT = span > STABILITY_EPSILON ? (t - kStart) / span : 0;
 
     return { segmentIndex: idx, localT: safeNumber(localT, 0) };
@@ -172,115 +288,27 @@ export class CatmullRomSpline implements Curve {
 
   evaluate(t: number): Point {
     const { segmentIndex, localT } = this.findSegment(t);
-    const n = this.controlPoints.length;
-
-    let p0Idx: number, p1Idx: number, p2Idx: number, p3Idx: number;
-
-    if (this.closed) {
-      p0Idx = (segmentIndex - 1 + n) % n;
-      p1Idx = segmentIndex;
-      p2Idx = (segmentIndex + 1) % n;
-      p3Idx = (segmentIndex + 2) % n;
-    } else {
-      p0Idx = segmentIndex - 1;
-      p1Idx = segmentIndex;
-      p2Idx = segmentIndex + 1;
-      p3Idx = segmentIndex + 2;
-    }
-
-    const p0 = this.getPoint(p0Idx);
-    const p1 = this.controlPoints[this.closed ? p1Idx : Math.min(Math.max(p1Idx, 0), n - 1)];
-    const p2 = this.controlPoints[this.closed ? p2Idx : Math.min(Math.max(p2Idx, 0), n - 1)];
-    const p3 = this.getPoint(p3Idx);
-
-    return safePoint(this.catmullRom(p0, p1, p2, p3, localT, this.tension));
-  }
-
-  private catmullRom(
-    p0: Point, p1: Point, p2: Point, p3: Point,
-    t: number, alpha: number = 0.5
-  ): Point {
-    const t2 = t * t;
-    const t3 = t2 * t;
-
-    const a0 = p1;
-    const a1 = {
-      x: alpha * (p2.x - p0.x),
-      y: alpha * (p2.y - p0.y)
-    };
-    const a2 = {
-      x: 2 * alpha * p0.x + (alpha - 3) * p1.x + (3 - 2 * alpha) * p2.x - alpha * p3.x,
-      y: 2 * alpha * p0.y + (alpha - 3) * p1.y + (3 - 2 * alpha) * p2.y - alpha * p3.y
-    };
-    const a3 = {
-      x: -alpha * p0.x + (2 - alpha) * p1.x + (alpha - 2) * p2.x + alpha * p3.x,
-      y: -alpha * p0.y + (2 - alpha) * p1.y + (alpha - 2) * p2.y + alpha * p3.y
-    };
-
-    return {
-      x: a0.x + a1.x * t + a2.x * t2 + a3.x * t3,
-      y: a0.y + a1.y * t + a2.y * t2 + a3.y * t3
-    };
-  }
-
-  private catmullRomDerivative(
-    p0: Point, p1: Point, p2: Point, p3: Point,
-    t: number, alpha: number = 0.5
-  ): Point {
-    const t2 = t * t;
-
-    const a1 = {
-      x: alpha * (p2.x - p0.x),
-      y: alpha * (p2.y - p0.y)
-    };
-    const a2 = {
-      x: 2 * alpha * p0.x + (alpha - 3) * p1.x + (3 - 2 * alpha) * p2.x - alpha * p3.x,
-      y: 2 * alpha * p0.y + (alpha - 3) * p1.y + (3 - 2 * alpha) * p2.y - alpha * p3.y
-    };
-    const a3 = {
-      x: -alpha * p0.x + (2 - alpha) * p1.x + (alpha - 2) * p2.x + alpha * p3.x,
-      y: -alpha * p0.y + (2 - alpha) * p1.y + (alpha - 2) * p2.y + alpha * p3.y
-    };
-
-    return {
-      x: a1.x + 2 * a2.x * t + 3 * a3.x * t2,
-      y: a1.y + 2 * a2.y * t + 3 * a3.y * t2
-    };
+    const seg = this.segments[segmentIndex];
+    if (!seg) return safePoint(this.controlPoints[0] ?? createPoint(0, 0));
+    const s = localT;
+    const s2 = s * s;
+    const s3 = s2 * s;
+    return safePoint({
+      x: seg.a.x + seg.b.x * s + seg.c.x * s2 + seg.d.x * s3,
+      y: seg.a.y + seg.b.y * s + seg.c.y * s2 + seg.d.y * s3
+    });
   }
 
   derivative(t: number): Point {
     const { segmentIndex, localT } = this.findSegment(clamp(t, 0, 1));
-    const n = this.controlPoints.length;
-
-    let p0Idx: number, p1Idx: number, p2Idx: number, p3Idx: number;
-
-    if (this.closed) {
-      p0Idx = (segmentIndex - 1 + n) % n;
-      p1Idx = segmentIndex;
-      p2Idx = (segmentIndex + 1) % n;
-      p3Idx = (segmentIndex + 2) % n;
-    } else {
-      p0Idx = segmentIndex - 1;
-      p1Idx = segmentIndex;
-      p2Idx = segmentIndex + 1;
-      p3Idx = segmentIndex + 2;
-    }
-
-    const p0 = this.getPoint(p0Idx);
-    const p1 = this.controlPoints[this.closed ? p1Idx : Math.min(Math.max(p1Idx, 0), n - 1)];
-    const p2 = this.controlPoints[this.closed ? p2Idx : Math.min(Math.max(p2Idx, 0), n - 1)];
-    const p3 = this.getPoint(p3Idx);
-
-    const nSegments = this.getSegmentCount();
-    const kStart = this.knots[segmentIndex] ?? 0;
-    const kEnd = this.knots[segmentIndex + 1] ?? 1;
-    const span = kEnd - kStart;
-    const spanFactor = span > STABILITY_EPSILON ? 1 / span : nSegments;
-
-    const d = this.catmullRomDerivative(p0, p1, p2, p3, localT, this.tension);
+    const seg = this.segments[segmentIndex];
+    if (!seg) return createPoint(0, 0);
+    const s = localT;
+    const s2 = s * s;
+    const hi = seg.span > STABILITY_EPSILON ? seg.span : STABILITY_EPSILON;
     return safePoint({
-      x: d.x * spanFactor,
-      y: d.y * spanFactor
+      x: (seg.b.x + 2 * seg.c.x * s + 3 * seg.d.x * s2) / hi,
+      y: (seg.b.y + 2 * seg.c.y * s + 3 * seg.d.y * s2) / hi
     });
   }
 
@@ -296,8 +324,9 @@ export class CatmullRomSpline implements Curve {
       throw new Error('Sample count must be at least 2');
     }
     const result: Point[] = [];
-    for (let i = 0; i < count; i++) {
-      const t = i / (count - 1);
+    const n = Math.min(count, 100000);
+    for (let i = 0; i < n; i++) {
+      const t = i / (n - 1);
       result.push(this.evaluate(t));
     }
     return result;
@@ -337,38 +366,16 @@ export class CatmullRomSpline implements Curve {
 
   toBezierSegments(): CubicBezier[] {
     const segments: CubicBezier[] = [];
-    const n = this.getSegmentCount();
-    const alpha = this.tension;
-    const cp = this.controlPoints;
-    const numPoints = cp.length;
 
-    for (let i = 0; i < n; i++) {
-      let p0Idx: number, p1Idx: number, p2Idx: number, p3Idx: number;
+    for (const seg of this.segments) {
+      const a = seg.a, b = seg.b, c = seg.c, d = seg.d;
 
-      if (this.closed) {
-        p0Idx = (i - 1 + numPoints) % numPoints;
-        p1Idx = i;
-        p2Idx = (i + 1) % numPoints;
-        p3Idx = (i + 2) % numPoints;
-      } else {
-        p0Idx = i - 1;
-        p1Idx = i;
-        p2Idx = i + 1;
-        p3Idx = i + 2;
-      }
+      const p0 = { ...a };
+      const c1 = addPoints(a, scalePoint(b, 1 / 3));
+      const c2 = addPoints(addPoints(a, scalePoint(b, 2 / 3)), scalePoint(c, 1 / 3));
+      const p3 = addPoints(addPoints(addPoints(a, b), c), d);
 
-      const p0 = this.getPoint(p0Idx);
-      const p1 = cp[this.closed ? p1Idx : Math.min(Math.max(p1Idx, 0), numPoints - 1)];
-      const p2 = cp[this.closed ? p2Idx : Math.min(Math.max(p2Idx, 0), numPoints - 1)];
-      const p3 = this.getPoint(p3Idx);
-
-      const tangent1 = scalePoint(subPoints(p2, p0), alpha);
-      const tangent2 = scalePoint(subPoints(p3, p1), alpha);
-
-      const c1 = addPoints(p1, scalePoint(tangent1, 1 / 3));
-      const c2 = subPoints(p2, scalePoint(tangent2, 1 / 3));
-
-      segments.push(new CubicBezier(p1, c1, c2, p2));
+      segments.push(new CubicBezier(p0, c1, c2, p3));
     }
 
     return segments;
@@ -419,11 +426,26 @@ export class CatmullRomSpline implements Curve {
       const tBefore = Math.max(0, t - 1e-8);
       const tAfter = Math.min(1, t + 1e-8);
 
-      const dBefore = this.tangent(tBefore);
-      const dAfter = this.tangent(tAfter);
+      const dBefore = this.derivative(tBefore);
+      const dAfter = this.derivative(tAfter);
+      const lenBefore = Math.sqrt(dBefore.x * dBefore.x + dBefore.y * dBefore.y);
+      const lenAfter = Math.sqrt(dAfter.x * dAfter.x + dAfter.y * dAfter.y);
 
-      const dotP = dBefore.x * dAfter.x + dBefore.y * dAfter.y;
-      if (Math.abs(dotP - 1) > tolerance) return false;
+      if (lenBefore < STABILITY_EPSILON && lenAfter < STABILITY_EPSILON) {
+        continue;
+      }
+
+      if (lenBefore > STABILITY_EPSILON && lenAfter > STABILITY_EPSILON) {
+        const dotP = (dBefore.x * dAfter.x + dBefore.y * dAfter.y) / (lenBefore * lenAfter);
+        if (Math.abs(dotP - 1) > tolerance) return false;
+      }
+
+      if (lenBefore > STABILITY_EPSILON && lenAfter > STABILITY_EPSILON) {
+        const speedRatio = Math.abs(lenBefore - lenAfter) / Math.max(lenBefore, lenAfter);
+        if (speedRatio > tolerance * 1000) {
+          return false;
+        }
+      }
     }
 
     return true;

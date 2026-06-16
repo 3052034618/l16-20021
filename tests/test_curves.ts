@@ -425,6 +425,158 @@ testSection('测试 12: SVG 导出与互转', () => {
   assert(fullSvg.includes('<path'), '完整 SVG 含 path 标签');
 });
 
+testSection('测试 13: Catmull-Rom 非均匀时间戳速度 C¹ 连续', () => {
+  const pts: Point[] = [
+    createPoint(0, 0),
+    createPoint(50, 100),
+    createPoint(150, 80),
+    createPoint(250, 200),
+    createPoint(350, 0)
+  ];
+  const cr = new CatmullRomSpline(pts, {
+    timeStamps: [0, 1, 5, 6, 10],
+    tension: 0.5
+  });
+
+  assert(cr.verifyInterpolation(1e-6) === true, 'CR 经过所有控制点');
+  assert(cr.checkC1Continuity(1e-5) === true, 'CR C¹ 连续通过');
+
+  const analyzer = cr.getAnalyzer();
+  const profile = analyzer.speedProfile(200);
+  for (const p of profile) {
+    assert(isFinite(p.speed) && p.speed >= 0, '速度值有效');
+    assert(p.curvature === undefined || isFinite(p.curvature), '曲率值有效');
+  }
+
+  const knots = cr.getKnots();
+  for (let i = 1; i < knots.length - 1; i++) {
+    const k = knots[i];
+    const dPrev = cr.derivative(Math.max(0, k - 1e-6));
+    const dNext = cr.derivative(Math.min(1, k + 1e-6));
+    const lenPrev = Math.sqrt(dPrev.x * dPrev.x + dPrev.y * dPrev.y);
+    const lenNext = Math.sqrt(dNext.x * dNext.x + dNext.y * dNext.y);
+    if (lenPrev > 1e-6 && lenNext > 1e-6) {
+      const dot = (dPrev.x * dNext.x + dPrev.y * dNext.y) / (lenPrev * lenNext);
+      assert(Math.abs(dot - 1) < 1e-4, `关键帧${i}处方向连续`);
+      const speedRatio = Math.abs(lenPrev - lenNext) / Math.max(lenPrev, lenNext);
+      assert(speedRatio < 0.05, `关键帧${i}处速度跳变<5%`);
+    }
+  }
+});
+
+testSection('测试 14: SVG 导出形状与 evaluate 严格重合', () => {
+  const pts: Point[] = [
+    createPoint(0, 0),
+    createPoint(50, 100),
+    createPoint(150, 80),
+    createPoint(250, 200)
+  ];
+
+  const cr = new CatmullRomSpline(pts, { timeStamps: [0, 1, 5, 10] });
+  const bzSegs = cr.toBezierSegments();
+  const knots = cr.getKnots();
+
+  assert(bzSegs.length === pts.length - 1, 'CR 段数与控制点数量一致');
+
+  for (let i = 0; i < bzSegs.length; i++) {
+    const cp = bzSegs[i].getControlPoints();
+    assertPointApprox(cp[0], pts[i], 1e-6, `贝塞尔段${i}起点与CR控制点重合`);
+    assertPointApprox(cp[3], pts[i + 1], 1e-6, `贝塞尔段${i}终点与CR控制点重合`);
+  }
+
+  const perSegChecks = 20;
+  let maxErr = 0;
+  for (let i = 0; i < bzSegs.length; i++) {
+    const kStart = knots[i];
+    const kEnd = knots[i + 1];
+    for (let j = 0; j <= perSegChecks; j++) {
+      const s = j / perSegChecks;
+      const globalT = kStart + s * (kEnd - kStart);
+      const crPt = cr.evaluate(globalT);
+      const bzPt = bzSegs[i].evaluate(s);
+      const err = Math.max(
+        Math.abs(crPt.x - bzPt.x),
+        Math.abs(crPt.y - bzPt.y)
+      );
+      if (err > maxErr) maxErr = err;
+      assert(err < 1e-5, `段${i} s=${s.toFixed(3)} CR与贝塞尔形状一致, err=${err}`);
+    }
+  }
+
+  const crSvg = CurveIO.toSVGPath(cr);
+  const bzSvg = CurveIO.toSVGPath(bzSegs);
+  assert(crSvg === bzSvg, 'CR SVG 与贝塞尔段 SVG 字符串完全相同');
+});
+
+testSection('测试 15: 大量控制点性能 / 稳定性', () => {
+  const N_SMALL = 1000;
+  const smallPts: Point[] = [];
+  for (let i = 0; i < N_SMALL; i++) {
+    const t = i / (N_SMALL - 1);
+    smallPts.push(createPoint(t * 1000, Math.sin(t * Math.PI * 4) * 100 + t * 200));
+  }
+
+  const t1 = Date.now();
+  const linBig = new LinearInterpolation(smallPts);
+  const t2 = Date.now();
+  const buildLin = t2 - t1;
+  assert(buildLin < 2000, `LinearInterpolation(${N_SMALL}点) 构建<2s, 实际=${buildLin}ms`);
+
+  const sample100 = linBig.sample(100);
+  assert(sample100.length === 100, 'Linear 采样100个点正确');
+  for (const p of sample100) {
+    assert(Number.isFinite(p.x) && Number.isFinite(p.y), 'Linear 采样有限值');
+  }
+
+  const t3 = Date.now();
+  const splineBig = new CubicSpline(smallPts, { endCondition: 'natural' });
+  const t4 = Date.now();
+  const buildSpline = t4 - t3;
+  assert(buildSpline < 5000, `CubicSpline(${N_SMALL}点) 构建<5s, 实际=${buildSpline}ms`);
+
+  const splineSample = splineBig.sample(50);
+  assert(splineSample.length === 50, 'Spline 采样50点正确');
+  for (const p of splineSample) {
+    assert(Number.isFinite(p.x) && Number.isFinite(p.y), 'Spline 采样有限值');
+  }
+
+  const N_BEZIER = 200;
+  const bzPts: Point[] = [];
+  for (let i = 0; i < N_BEZIER; i++) {
+    const t = i / (N_BEZIER - 1);
+    bzPts.push(createPoint(t * 500, Math.sin(t * 8) * 50 + 100));
+  }
+
+  const t5 = Date.now();
+  const bzBig = new BezierCurve(bzPts);
+  const t6 = Date.now();
+  const buildBz = t6 - t5;
+  assert(buildBz < 5000, `Bezier(degree=${N_BEZIER - 1}) 构建<5s, 实际=${buildBz}ms`);
+
+  for (let i = 0; i <= 20; i++) {
+    const t = i / 20;
+    const p = bzBig.evaluate(t);
+    assert(Number.isFinite(p.x) && Number.isFinite(p.y), `Bezier evaluate(${t}) 有限值`);
+  }
+
+  const bzSample = bzBig.sample(20);
+  assert(bzSample.length === 20, 'Bezier sample(20) 正确');
+
+  const CR_N = 1000;
+  const crPts: Point[] = [];
+  for (let i = 0; i < CR_N; i++) {
+    const tt = i / (CR_N - 1);
+    crPts.push(createPoint(tt * 2000, Math.cos(tt * Math.PI * 6) * 80 + tt * 500));
+  }
+  const t7 = Date.now();
+  const crBig = new CatmullRomSpline(crPts);
+  const t8 = Date.now();
+  const buildCR = t8 - t7;
+  assert(buildCR < 5000, `CatmullRom(${CR_N}点) 构建<5s, 实际=${buildCR}ms`);
+  const crMid = crBig.evaluate(0.5);
+  assert(Number.isFinite(crMid.x) && Number.isFinite(crMid.y), 'CR 中点求值有限');
+});
+
 console.log('\n' + '='.repeat(50));
 console.log(` 测试结果: ${passed} 通过, ${failed} 失败`);
 console.log('='.repeat(50));
