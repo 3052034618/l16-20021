@@ -1,0 +1,20 @@
+{
+  "name": "curve-interpolation-engine",
+  "version": "1.0.0",
+  "description": "曲线与插值引擎：线性插值、三次样条、贝塞尔曲线、Catmull-Rom样条，含弧长均匀采样",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "demo": "ts-node demo/demo.ts",
+    "test": "ts-node tests/test_curves.ts"
+  },
+  "keywords": ["curve", "interpolation", "spline", "bezier", "catmull-rom"],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "ts-node": "^10.9.0",
+    "@types/node": "^20.0.0"
+  }
+}
