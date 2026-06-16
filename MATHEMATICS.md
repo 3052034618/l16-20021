@@ -324,6 +324,152 @@ $$
 
 ---
 
+## 7. 非均匀 Knots 与时间戳参数化
+
+### 7.1 为什么需要非均匀参数化？
+
+默认均匀分段假设每段控制点间隔时间相同。但在动画中，关键帧往往间隔不均匀（如 0s, 1s, 3s, 7s），如果仍按均匀分段插值，动画的速度会与真实时间脱节。
+
+### 7.2 Knot 类型
+
+- **Uniform (均匀)**：$t_i = i/n$，适用于控制点等时间间隔
+- **Chordal (弦长)**：$t_i \propto \sum_{k=1}^{i} |P_k-P_{k-1}|$，按相邻点距离分配参数
+- **Centripetal (向心)**：$t_i \propto \sum \sqrt{|P_k-P_{k-1}|}$，缓解曲线自交
+- **自定义时间戳**：直接用时间戳数组 `[0, 1, 3, 7]`，自动归一化到 [0,1]
+
+### 7.3 非均匀分段的样条推导
+
+设全局参数 $t \in [0,1]$，段 $i$ 对应 $t \in [k_i, k_{i+1}]$，段宽 $\Delta_i = k_{i+1}-k_i$。定义局部参数 $s = (t - k_i) / \Delta_i \in [0,1]$。
+
+每段多项式 $S_i(s) = a_i + b_i s + c_i s^2 + d_i s^3$，对全局 $t$ 的导数：
+
+$$
+\frac{dS}{dt} = \frac{dS}{ds} \cdot \frac{ds}{dt} = \frac{b_i + 2 c_i s + 3 d_i s^2}{\Delta_i}
+$$
+
+$$
+\frac{d^2 S}{dt^2} = \frac{2 c_i + 6 d_i s}{\Delta_i^2}
+$$
+
+在段边界处 C¹ 和 C² 连续的约束方程推导后，仍归结为三对角方程组：
+
+$$
+\Delta_{i-1} M_{i-1} + 2(\Delta_{i-1} + \Delta_i) M_i + \Delta_i M_{i+1} = 6\left(\frac{y_{i+1}-y_i}{\Delta_i} - \frac{y_i-y_{i-1}}{\Delta_{i-1}}\right)
+$$
+
+系数为：
+$$
+a_i = y_i, \quad b_i = (y_{i+1}-y_i) - \Delta_i^2 (2 M_i + M_{i+1})/6
+$$
+$$
+c_i = M_i \Delta_i^2 / 2, \quad d_i = (M_{i+1} - M_i) \Delta_i^2 / 6
+$$
+
+实现代码: [cubic_spline.ts](file:///d:/trae-bz/TraeProjects/20021/src/cubic_spline.ts) · [catmull_rom.ts](file:///d:/trae-bz/TraeProjects/20021/src/catmull_rom.ts)
+
+---
+
+## 8. 曲线分析
+
+### 8.1 曲率
+
+参数曲线 $\mathbf{r}(t) = (x(t), y(t))$ 的曲率为：
+
+$$
+\kappa(t) = \frac{x'(t) y''(t) - y'(t) x''(t)}{\left(x'(t)^2 + y'(t)^2\right)^{3/2}}
+$$
+
+曲率半径 $R(t) = 1/|\kappa(t)|$，表示曲线在该点的密切圆半径。
+
+### 8.2 最近点 / 投影参数
+
+给定点 $Q$，寻找 $t^*$ 使 $|\mathbf{r}(t^*) - Q|$ 最小。
+
+**算法：牛顿迭代法**
+目标：最小化 $f(t) = |\mathbf{r}(t) - Q|^2$。
+$f'(t) = 2(\mathbf{r}(t) - Q) \cdot \mathbf{r}'(t)$，$f''(t) = 2|\mathbf{r}'(t)|^2 + 2(\mathbf{r}(t)-Q) \cdot \mathbf{r}''(t)$
+
+迭代：
+$$
+t_{n+1} = t_n - \frac{(\mathbf{r}(t_n)-Q) \cdot \mathbf{r}'(t_n)}{|\mathbf{r}'(t_n)|^2 + (\mathbf{r}(t_n)-Q) \cdot \mathbf{r}''(t_n)}
+$$
+
+当分母为负（凹点）时退化为梯度下降步长。
+
+实现代码: [curve_analyzer.ts](file:///d:/trae-bz/TraeProjects/20021/src/curve_analyzer.ts)
+
+### 8.3 包围盒
+
+采样曲线 N 个点取 min/max，得到：
+$$
+\text{BBox} = [\min x, \max x] \times [\min y, \max y]
+$$
+
+### 8.4 速度分析
+
+$\mathbf{v}(t) = \mathbf{r}'(t)$ 为速度向量，$|\mathbf{v}(t)|$ 为速率。
+加速度 $\mathbf{a}(t) = \mathbf{r}''(t)$。
+
+可用于路径跟随的速度规划、碰撞预估等。
+
+---
+
+## 9. 曲线互导
+
+### 9.1 SVG Path 导出
+
+将曲线转换为 SVG `d` 属性字符串：
+- `M x y` — 移动到起点
+- `L x y` — 直线段（折线）
+- `C x1 y1, x2 y2, x y` — 三次贝塞尔曲线段
+
+### 9.2 Catmull-Rom → 贝塞尔段
+
+每段 CR 的 4 控制点 $P_{i-1}, P_i, P_{i+1}, P_{i+2}$ 转成贝塞尔：
+$$
+B_0 = P_i, \quad B_1 = P_i + \frac{\alpha}{3}(P_{i+1}-P_{i-1})
+$$
+$$
+B_2 = P_{i+1} - \frac{\alpha}{3}(P_{i+2}-P_i), \quad B_3 = P_{i+1}
+$$
+
+### 9.3 采样点 → 贝塞尔拟合（最小二乘）
+
+给定采样点集 $\{Q_k\}$，拟合多段 CubicBezier。
+
+**步骤：**
+1. 用弦长参数化估计参数 $u_k$
+2. 每段用端点条件和最小二乘求控制点 $B_1, B_2$
+3. 若误差超限则在最大误差处递归细分
+
+实现代码: [curve_io.ts](file:///d:/trae-bz/TraeProjects/20021/src/curve_io.ts)
+
+---
+
+## 10. 数值稳定性
+
+### 10.1 常见退化场景
+
+| 场景 | 处理方式 |
+|------|---------|
+| NaN / Infinity 点 | 自动过滤，保留有效点 |
+| 连续重复点 | 去重（距离 < 1e-10） |
+| 所有点重合 | 标记 `allCollapsed`，构造器抛出友好错误 |
+| 极短段 $|P_{i+1}-P_i| < \epsilon$ | 归一化时用极小值替代，防止除零 |
+| 大量控制点 (>10000) | 打印性能警告 |
+| 段查找 | 二分查找 $O(\log n)$ 替代线性遍历 |
+
+### 10.2 安全工具函数
+
+- `safeNumber(v, fallback)` — 非有限数字替换
+- `safePoint(p, fallback)` — 非有限坐标点替换
+- `safeNormalize(v, fallback)` — 零向量替代
+- `safeDivide(a, b, fallback)` — 防除零
+
+实现代码: [stability.ts](file:///d:/trae-bz/TraeProjects/20021/src/stability.ts)
+
+---
+
 ## 项目文件结构
 
 ```
@@ -332,13 +478,16 @@ src/
 ├── index.ts              # 统一导出入口
 ├── linear.ts             # 分段线性插值
 ├── tridiagonal.ts        # 三对角方程组 Thomas 算法
-├── cubic_spline.ts        # 三次样条插值
-├── bezier.ts             # 贝塞尔曲线（de Casteljau、细分、升阶、自适应细分
-├── catmull_rom.ts        # Catmull-Rom 样条（过控制点）
-└── arc_length.ts         # 弧长计算与均匀采样重参数化
+├── cubic_spline.ts       # 三次样条插值（支持非均匀knots/时间戳）
+├── bezier.ts             # 贝塞尔曲线（de Casteljau、细分、升阶、自适应细分）
+├── catmull_rom.ts        # Catmull-Rom 样条（过控制点，支持时间戳）
+├── arc_length.ts         # 弧长计算与均匀采样重参数化
+├── stability.ts          # 数值稳定性、输入清洗、包围盒
+├── curve_analyzer.ts     # 曲线分析（最近点、曲率、包围盒、速度）
+└── curve_io.ts           # 互导（SVG path、贝塞尔拟合、Catmull-Rom转贝塞尔）
 
-demo/demo.ts              # 各类曲线功能演示
-tests/test_curves.ts        # 单元测试（70项全部通过）
+demo/demo.ts              # 各类曲线功能演示（11项演示）
+tests/test_curves.ts      # 单元测试（119项全部通过）
 ```
 
 ## 运行方式
@@ -347,7 +496,7 @@ tests/test_curves.ts        # 单元测试（70项全部通过）
 # 安装依赖
 npm install
 
-# 运行单元测试
+# 运行单元测试（119项）
 npm test
 
 # 运行完整演示
@@ -360,29 +509,61 @@ npm run build
 ## API 速查
 
 ```typescript
+// ============ 1. 各类曲线 ============
 // 线性插值
 const lin = new LinearInterpolation(points);
-lin.evaluate(0.5);          // 参数求值
-lin.sampleByArcLength(20);     // 弧长均匀采样
 
-// 三次样条
-const spline = new CubicSpline(points, { endCondition: 'natural' });
-spline.checkContinuity();      // 检查 C0/C1/C2 连续性
-spline.getSegments();          // 获取各段三次多项式系数
+// 三次样条（支持时间戳/knots）
+const spline = new CubicSpline(points, {
+  endCondition: 'natural', // 'natural' | 'clamped' | 'not-a-knot'
+  knotType: 'chordal',     // 'uniform' | 'chordal' | 'centripetal'
+  timeStamps: [0, 1, 3, 7] // 直接指定关键帧时间
+});
+spline.sampleByTimestamps([0, 0.5, 1, 1.5, 2]); // 按真实时间采样
 
 // 贝塞尔曲线
 const bezier = new BezierCurve(controlPoints);
-bezier.evaluate(0.3);        // de Casteljau 递归求值
-bezier.evaluateBernstein(0.3);   // Bernstein 基函数求值
-const { left, right } = bezier.subdivide(0.5);  // 曲线一分为二
-bezier.adaptiveSubdivision(0.1); // 自适应细分
+bezier.evaluate(0.3);
+bezier.subdivide(0.5);   // 一分为二
+bezier.adaptiveSubdivision(0.1);
+const cubic = new CubicBezier(p0, c1, c2, p3);
 
-// Catmull-Rom 样条（过所有点！）
-const cr = new CatmullRomSpline(points, { tension: 0.5, closed: false });
-cr.verifyInterpolation();      // 验证确实经过控制点
-cr.toBezierSegments();        // 转换为贝塞尔段列表
+// Catmull-Rom（经过所有控制点）
+const cr = new CatmullRomSpline(points, {
+  tension: 0.5, closed: false,
+  timeStamps: [0, 0.5, 2, 5] // 支持非均匀时间
+});
 
-// 弧长采样（任意曲线都支持）
-curve.arcLength(0, 0.5);     // 部分弧长
-curve.sampleByArcLength(50);  // 按弧长采 50 个等距点
+// ============ 2. 曲线分析 ============
+const analyzer = spline.getAnalyzer();
+analyzer.getBoundingBox();        // 包围盒
+analyzer.curvature(0.5);          // t=0.5 处曲率
+analyzer.speed(0.3);              // t=0.3 处速度大小
+analyzer.velocity(0.3);           // 速度向量
+analyzer.acceleration(0.3);       // 加速度向量
+analyzer.tangent(0.3);            // 单位切向量
+analyzer.normal(0.3);             // 单位法向量
+analyzer.findNearestPoint(target);// 最近点 + 参数 + 距离
+analyzer.isPointNearCurve(p, 5);  // 距曲线<5？
+analyzer.speedProfile(100);       // 速度、曲率、加速度剖面
+analyzer.analyze();               // 完整分析报告
+
+// ============ 3. 曲线互导 ============
+CurveIO.toSVGPath(curve);           // 导出 SVG path 字符串
+CurveIO.toSVGPath(bezierSegments);  // CubicBezier[] → SVG
+CurveIO.curveToFullSVG(curve, { width: 800, height: 600 }); // 完整 SVG 文件
+CurveIO.fitCubicBezier(sampledPoints, { maxError: 0.5 });  // 采样点反拟合贝塞尔
+
+// ============ 4. 弧长采样（所有曲线都支持） ============
+curve.arcLength(0, 0.5);         // 部分弧长
+curve.getTotalLength();          // 总弧长
+curve.sampleByArcLength(50);     // 按弧长均匀采 50 点
+
+// ============ 5. 数值稳定性工具 ============
+cleanInputPoints(points);        // 去重 + 过滤NaN + 标记退化
+autoKnots(n, 'chordal', pts);   // 自动生成 knots
+validateKnots(knots, n);         // 验证 knots 合法性
+computeBoundingBox(points);      // 包围盒
+safePoint(p), safeNumber(v), safeDivide(a, b)
 ```
+

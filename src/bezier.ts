@@ -2,6 +2,8 @@ import {
   Point, Curve, BezierSubdivision, lerpPoint, createPoint, clamp
 } from './types';
 import { ArcLengthSampler } from './arc_length';
+import { CurveAnalyzer } from './curve_analyzer';
+import { cleanInputPoints, safePoint, safeNumber, STABILITY_EPSILON } from './stability';
 
 export function binomialCoefficient(n: number, k: number): number {
   if (k < 0 || k > n) return 0;
@@ -22,14 +24,21 @@ export class BezierCurve implements Curve {
   private controlPoints: Point[];
   private degree: number;
   private arcLengthSampler: ArcLengthSampler;
+  private analyzer: CurveAnalyzer;
 
   constructor(controlPoints: Point[]) {
-    if (controlPoints.length < 2) {
-      throw new Error('BezierCurve requires at least 2 control points');
+    const cleaned = cleanInputPoints(controlPoints);
+    if (cleaned.points.length < 2) {
+      throw new Error('BezierCurve requires at least 2 valid distinct control points');
     }
-    this.controlPoints = [...controlPoints];
+    this.controlPoints = cleaned.points;
     this.degree = this.controlPoints.length - 1;
     this.arcLengthSampler = new ArcLengthSampler((t) => this.evaluate(t), 2000);
+    this.analyzer = new CurveAnalyzer(
+      (t) => this.evaluate(t),
+      (t) => this.derivative(t),
+      200
+    );
   }
 
   getDegree(): number {
@@ -245,6 +254,10 @@ export class BezierCurve implements Curve {
   sampleByArcLength(count: number): Point[] {
     return this.arcLengthSampler.sampleByArcLength(count);
   }
+
+  getAnalyzer(): CurveAnalyzer {
+    return this.analyzer;
+  }
 }
 
 export class QuadraticBezier extends BezierCurve {
@@ -265,6 +278,7 @@ export class CompositeBezierCurve implements Curve {
   private arcLengthSampler: ArcLengthSampler;
   private segmentStartParams: number[] = [];
   private closed: boolean;
+  private analyzer: CurveAnalyzer;
 
   constructor(curves: BezierCurve[], closed: boolean = false) {
     if (curves.length === 0) {
@@ -280,6 +294,11 @@ export class CompositeBezierCurve implements Curve {
     }
     this.arcLengthSampler = new ArcLengthSampler((t) => this.evaluate(t), 3000);
     this.totalLength = this.arcLengthSampler.getTotalLength();
+    this.analyzer = new CurveAnalyzer(
+      (t) => this.evaluate(t),
+      (t) => this.derivative(t),
+      200
+    );
   }
 
   private findSegment(t: number): { curveIndex: number; localT: number } {
@@ -336,5 +355,9 @@ export class CompositeBezierCurve implements Curve {
 
   isClosed(): boolean {
     return this.closed;
+  }
+
+  getAnalyzer(): CurveAnalyzer {
+    return this.analyzer;
   }
 }

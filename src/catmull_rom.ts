@@ -1,30 +1,116 @@
 import {
-  Point, Curve, createPoint, clamp, addPoints, subPoints, scalePoint
+  Point, Curve, createPoint, clamp, addPoints, subPoints, scalePoint, distance
 } from './types';
 import { ArcLengthSampler } from './arc_length';
 import { CubicBezier, BezierCurve } from './bezier';
+import { CurveAnalyzer } from './curve_analyzer';
+import {
+  cleanInputPoints, validateKnots, autoKnots, safePoint, safeNumber, STABILITY_EPSILON
+} from './stability';
+
+export interface CatmullRomOptions {
+  tension?: number;
+  closed?: boolean;
+  knots?: number[];
+  knotType?: 'uniform' | 'chordal' | 'centripetal';
+  timeStamps?: number[];
+}
 
 export class CatmullRomSpline implements Curve {
   private controlPoints: Point[];
   private tension: number;
   private arcLengthSampler: ArcLengthSampler;
+  private analyzer: CurveAnalyzer;
   private totalLength: number;
   private closed: boolean;
+  private knots: number[] = [];
+  private options: CatmullRomOptions;
 
-  constructor(points: Point[], options: { tension?: number; closed?: boolean } = {}) {
-    if (points.length < 2) {
-      throw new Error('CatmullRomSpline requires at least 2 control points');
+  constructor(points: Point[], options: CatmullRomOptions = {}) {
+    this.options = { ...options };
+    const cleaned = cleanInputPoints(points);
+
+    if (cleaned.points.length < 2) {
+      throw new Error('CatmullRomSpline requires at least 2 valid distinct control points');
     }
-    this.controlPoints = [...points];
+
+    this.controlPoints = cleaned.points;
     this.tension = options.tension ?? 0.5;
     this.closed = options.closed ?? false;
 
-    if (this.closed && points.length < 3) {
+    if (this.closed && cleaned.points.length < 3) {
       throw new Error('Closed CatmullRomSpline requires at least 3 control points');
     }
 
+    this.setupKnots();
+
     this.arcLengthSampler = new ArcLengthSampler((t) => this.evaluate(t), 2000);
     this.totalLength = this.arcLengthSampler.getTotalLength();
+    this.analyzer = new CurveAnalyzer(
+      (t) => this.evaluate(t),
+      (t) => this.derivative(t),
+      200
+    );
+  }
+
+  private setupKnots(): void {
+    const n = this.getSegmentCount() + 1;
+
+    if (this.options.timeStamps) {
+      const ts = this.options.timeStamps;
+      const nPts = this.controlPoints.length;
+      const validation = validateKnots(ts, nPts);
+      if (!validation.valid) {
+        console.warn(`[CatmullRom] Invalid timeStamps: ${validation.reason}, falling back.`);
+        this.knots = this.buildKnotsFromSegmentCount(this.getSegmentCount());
+      } else {
+        let minT = Infinity, maxT = -Infinity;
+        for (const t of ts) {
+          if (t < minT) minT = t;
+          if (t > maxT) maxT = t;
+        }
+        const range = maxT - minT;
+        if (range < STABILITY_EPSILON) {
+          this.knots = this.buildKnotsFromSegmentCount(this.getSegmentCount());
+        } else {
+          this.knots = ts.map(t => (t - minT) / range);
+        }
+      }
+      return;
+    }
+
+    if (this.options.knots) {
+      const kts = this.options.knots;
+      const nPts = this.controlPoints.length;
+      const validation = validateKnots(kts, nPts);
+      if (!validation.valid) {
+        console.warn(`[CatmullRom] Invalid knots: ${validation.reason}, falling back.`);
+        this.knots = this.buildKnotsFromSegmentCount(this.getSegmentCount());
+      } else {
+        this.knots = kts;
+      }
+      return;
+    }
+
+    this.knots = autoKnots(
+      this.getSegmentCount() + 1,
+      this.options.knotType ?? 'uniform',
+      this.closed
+        ? [...this.controlPoints, this.controlPoints[0]]
+        : this.controlPoints
+    );
+  }
+
+  private buildKnotsFromSegmentCount(nSegments: number): number[] {
+    const result: number[] = [];
+    for (let i = 0; i <= nSegments; i++) {
+      result.push(i / nSegments);
+    }
+    return result;
+  }
+
+  getKnots(): number[] {
+    return [...this.knots];
   }
 
   private getPoint(index: number): Point {
@@ -59,11 +145,29 @@ export class CatmullRomSpline implements Curve {
   private findSegment(t: number): { segmentIndex: number; localT: number } {
     t = clamp(t, 0, 1);
     const n = this.getSegmentCount();
-    let scaledT = t * n;
-    if (scaledT >= n) scaledT = n - 1e-12;
-    const segmentIndex = Math.floor(scaledT);
-    const localT = scaledT - segmentIndex;
-    return { segmentIndex, localT };
+    if (n === 0) return { segmentIndex: 0, localT: 0 };
+
+    if (t >= 1) {
+      return { segmentIndex: n - 1, localT: 1 };
+    }
+
+    let lo = 0, hi = n - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (this.knots[mid + 1] < t) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+
+    const idx = lo;
+    const kStart = this.knots[idx] ?? 0;
+    const kEnd = this.knots[idx + 1] ?? 1;
+    const span = kEnd - kStart;
+    const localT = span > STABILITY_EPSILON ? (t - kStart) / span : 0;
+
+    return { segmentIndex: idx, localT: safeNumber(localT, 0) };
   }
 
   evaluate(t: number): Point {
@@ -89,7 +193,7 @@ export class CatmullRomSpline implements Curve {
     const p2 = this.controlPoints[this.closed ? p2Idx : Math.min(Math.max(p2Idx, 0), n - 1)];
     const p3 = this.getPoint(p3Idx);
 
-    return this.catmullRom(p0, p1, p2, p3, localT, this.tension);
+    return safePoint(this.catmullRom(p0, p1, p2, p3, localT, this.tension));
   }
 
   private catmullRom(
@@ -168,17 +272,22 @@ export class CatmullRomSpline implements Curve {
     const p3 = this.getPoint(p3Idx);
 
     const nSegments = this.getSegmentCount();
+    const kStart = this.knots[segmentIndex] ?? 0;
+    const kEnd = this.knots[segmentIndex + 1] ?? 1;
+    const span = kEnd - kStart;
+    const spanFactor = span > STABILITY_EPSILON ? 1 / span : nSegments;
+
     const d = this.catmullRomDerivative(p0, p1, p2, p3, localT, this.tension);
-    return {
-      x: d.x * nSegments,
-      y: d.y * nSegments
-    };
+    return safePoint({
+      x: d.x * spanFactor,
+      y: d.y * spanFactor
+    });
   }
 
   tangent(t: number): Point {
     const d = this.derivative(t);
     const len = Math.sqrt(d.x * d.x + d.y * d.y);
-    if (len < 1e-15) return createPoint(0, 0);
+    if (len < STABILITY_EPSILON) return createPoint(0, 0);
     return createPoint(d.x / len, d.y / len);
   }
 
@@ -194,12 +303,32 @@ export class CatmullRomSpline implements Curve {
     return result;
   }
 
+  sampleByTimestamps(timeStamps: number[]): Point[] {
+    if (!this.options.timeStamps) {
+      return this.sample(timeStamps.length);
+    }
+    const ts = this.options.timeStamps;
+    let minT = Infinity, maxT = -Infinity;
+    for (const t of ts) {
+      if (t < minT) minT = t;
+      if (t > maxT) maxT = t;
+    }
+    const range = maxT - minT;
+    if (range < STABILITY_EPSILON) {
+      return timeStamps.map(() => this.evaluate(0));
+    }
+    return timeStamps.map(t => {
+      const normT = (t - minT) / range;
+      return this.evaluate(normT);
+    });
+  }
+
   arcLength(t0: number = 0, t1: number = 1): number {
-    return this.arcLengthSampler.arcLength(t0, t1);
+    return safeNumber(this.arcLengthSampler.arcLength(t0, t1), 0);
   }
 
   getTotalLength(): number {
-    return this.totalLength;
+    return safeNumber(this.totalLength, 0);
   }
 
   sampleByArcLength(count: number): Point[] {
@@ -257,22 +386,18 @@ export class CatmullRomSpline implements Curve {
     return this.closed;
   }
 
+  getAnalyzer(): CurveAnalyzer {
+    return this.analyzer;
+  }
+
   verifyInterpolation(tolerance: number = 1e-9): boolean {
     const n = this.controlPoints.length;
     const nSegments = this.getSegmentCount();
 
     const checkPoints = this.closed ? n : n;
     for (let i = 0; i < checkPoints; i++) {
-      let t: number;
-      let expected: Point;
-
-      if (this.closed) {
-        t = i / nSegments;
-        expected = this.controlPoints[i];
-      } else {
-        t = i / nSegments;
-        expected = this.controlPoints[i];
-      }
+      const t = this.knots[i] ?? (i / nSegments);
+      const expected = this.controlPoints[this.closed ? i % n : i];
 
       const result = this.evaluate(t);
       const err = Math.max(
@@ -290,15 +415,15 @@ export class CatmullRomSpline implements Curve {
     const limit = this.closed ? nSegments : nSegments - 1;
 
     for (let i = 1; i <= limit; i++) {
-      const t = i / nSegments;
+      const t = this.knots[i] ?? (i / nSegments);
       const tBefore = Math.max(0, t - 1e-8);
       const tAfter = Math.min(1, t + 1e-8);
 
       const dBefore = this.tangent(tBefore);
       const dAfter = this.tangent(tAfter);
 
-      const dot = dBefore.x * dAfter.x + dBefore.y * dAfter.y;
-      if (Math.abs(dot - 1) > tolerance) return false;
+      const dotP = dBefore.x * dAfter.x + dBefore.y * dAfter.y;
+      if (Math.abs(dotP - 1) > tolerance) return false;
     }
 
     return true;

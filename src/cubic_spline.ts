@@ -4,17 +4,33 @@ import {
 } from './types';
 import { solveTridiagonal, createTridiagonalSystem } from './tridiagonal';
 import { ArcLengthSampler } from './arc_length';
+import { CurveAnalyzer } from './curve_analyzer';
+import {
+  cleanInputPoints, validateKnots, autoKnots, safePoint, safeNumber, STABILITY_EPSILON
+} from './stability';
+
+export interface CubicSplineExtendedOptions extends SplineOptions {
+  knots?: number[];
+  knotType?: 'uniform' | 'chordal' | 'centripetal';
+  timeStamps?: number[];
+}
 
 export class CubicSpline implements Curve {
   private controlPoints: Point[];
   private segments: SplineSegment[] = [];
   private arcLengthSampler: ArcLengthSampler;
+  private analyzer: CurveAnalyzer;
   private options: Required<SplineOptions>;
+  private extendedOptions: CubicSplineExtendedOptions;
   private totalLength: number = 0;
+  private knots: number[] = [];
 
-  constructor(points: Point[], options: SplineOptions = {}) {
-    if (points.length < 2) {
-      throw new Error('CubicSpline requires at least 2 control points');
+  constructor(points: Point[], options: CubicSplineExtendedOptions = {}) {
+    this.extendedOptions = { ...options };
+    const cleaned = cleanInputPoints(points);
+
+    if (cleaned.points.length < 2) {
+      throw new Error('CubicSpline requires at least 2 valid distinct control points');
     }
 
     this.options = {
@@ -23,10 +39,61 @@ export class CubicSpline implements Curve {
       endTangent: options.endTangent || { x: 0, y: 0 }
     };
 
-    this.controlPoints = [...points];
+    this.controlPoints = cleaned.points;
+
+    this.setupKnots();
     this.buildSpline();
     this.arcLengthSampler = new ArcLengthSampler((t) => this.evaluate(t), 2000);
     this.totalLength = this.arcLengthSampler.getTotalLength();
+    this.analyzer = new CurveAnalyzer(
+      (t) => this.evaluate(t),
+      (t) => this.derivative(t),
+      200
+    );
+  }
+
+  private setupKnots(): void {
+    const n = this.controlPoints.length;
+
+    if (this.extendedOptions.timeStamps) {
+      const ts = this.extendedOptions.timeStamps;
+      const validation = validateKnots(ts, n);
+      if (!validation.valid) {
+        console.warn(`[CubicSpline] Invalid timeStamps: ${validation.reason}, falling back to uniform.`);
+        this.knots = autoKnots(n, 'uniform');
+      } else {
+        let minT = Infinity, maxT = -Infinity;
+        for (const t of ts) {
+          if (t < minT) minT = t;
+          if (t > maxT) maxT = t;
+        }
+        const range = maxT - minT;
+        if (range < STABILITY_EPSILON) {
+          this.knots = autoKnots(n, 'uniform');
+        } else {
+          this.knots = ts.map(t => (t - minT) / range);
+        }
+      }
+      return;
+    }
+
+    if (this.extendedOptions.knots) {
+      const kts = this.extendedOptions.knots;
+      const validation = validateKnots(kts, n);
+      if (!validation.valid) {
+        console.warn(`[CubicSpline] Invalid knots: ${validation.reason}, falling back to uniform.`);
+        this.knots = autoKnots(n, 'uniform');
+      } else {
+        this.knots = kts;
+      }
+      return;
+    }
+
+    this.knots = autoKnots(n, this.extendedOptions.knotType ?? 'uniform', this.controlPoints);
+  }
+
+  getKnots(): number[] {
+    return [...this.knots];
   }
 
   private buildSpline(): void {
@@ -35,7 +102,8 @@ export class CubicSpline implements Curve {
 
     const h: number[] = [];
     for (let i = 0; i < n; i++) {
-      h.push(1);
+      const diff = this.knots[i + 1] - this.knots[i];
+      h.push(diff < STABILITY_EPSILON ? STABILITY_EPSILON : diff);
     }
 
     const xValues = this.controlPoints.map(p => p.x);
@@ -58,8 +126,8 @@ export class CubicSpline implements Curve {
       this.segments.push({
         xCoeff: xCoeffs[i],
         yCoeff: yCoeffs[i],
-        tStart: i / n,
-        tEnd: (i + 1) / n
+        tStart: this.knots[i],
+        tEnd: this.knots[i + 1]
       });
     }
   }
@@ -76,10 +144,9 @@ export class CubicSpline implements Curve {
     }
 
     if (n === 1) {
-      const slope = (y[1] - y[0]) / h[0];
       return [{
         a: y[0],
-        b: slope,
+        b: y[1] - y[0],
         c: 0,
         d: 0
       }];
@@ -92,7 +159,9 @@ export class CubicSpline implements Curve {
       a[i] = h[i - 1];
       b[i] = 2 * (h[i - 1] + h[i]);
       c[i] = h[i];
-      d[i] = 6 * ((y[i + 1] - y[i]) / h[i] - (y[i] - y[i - 1]) / h[i - 1]);
+      const dy1 = h[i] > STABILITY_EPSILON ? (y[i + 1] - y[i]) / h[i] : 0;
+      const dy2 = h[i - 1] > STABILITY_EPSILON ? (y[i] - y[i - 1]) / h[i - 1] : 0;
+      d[i] = 6 * (dy1 - dy2);
     }
 
     this.applyBoundaryConditions(a, b, c, d, h, y, startTangent, endTangent);
@@ -100,10 +169,12 @@ export class CubicSpline implements Curve {
     const M = solveTridiagonal(system);
 
     for (let i = 0; i < n; i++) {
+      const hi = h[i] > STABILITY_EPSILON ? h[i] : STABILITY_EPSILON;
+      const hi2 = hi * hi;
       const a_coeff = y[i];
-      const b_coeff = (y[i + 1] - y[i]) / h[i] - h[i] * (2 * M[i] + M[i + 1]) / 6;
-      const c_coeff = M[i] / 2;
-      const d_coeff = (M[i + 1] - M[i]) / (6 * h[i]);
+      const b_coeff = (y[i + 1] - y[i]) - hi2 * (2 * M[i] + M[i + 1]) / 6;
+      const c_coeff = M[i] * hi2 / 2;
+      const d_coeff = (M[i + 1] - M[i]) * hi2 / 6;
       coeffs.push({ a: a_coeff, b: b_coeff, c: c_coeff, d: d_coeff });
     }
 
@@ -129,26 +200,26 @@ export class CubicSpline implements Curve {
         break;
 
       case 'clamped':
-        b[0] = 2 * h[0];
-        c[0] = h[0];
-        d[0] = 6 * ((y[1] - y[0]) / h[0] - startTangent);
-        a[n] = h[n - 1];
-        b[n] = 2 * h[n - 1];
-        d[n] = 6 * (endTangent - (y[n] - y[n - 1]) / h[n - 1]);
+        const h0 = h[0] > STABILITY_EPSILON ? h[0] : STABILITY_EPSILON;
+        const hn = h[n - 1] > STABILITY_EPSILON ? h[n - 1] : STABILITY_EPSILON;
+        b[0] = 2 * h0;
+        c[0] = h0;
+        d[0] = 6 * ((y[1] - y[0]) / h0 - startTangent);
+        a[n] = hn;
+        b[n] = 2 * hn;
+        d[n] = 6 * (endTangent - (y[n] - y[n - 1]) / hn);
         break;
 
       case 'not-a-knot':
         if (n >= 2) {
           b[0] = h[1];
           c[0] = -(h[0] + h[1]);
-          d[0] = h[0];
-          const d0 = 0;
-
+          const tmp = h[0];
+          d[0] = tmp;
           a[n] = h[n - 2];
           b[n] = -(h[n - 2] + h[n - 1]);
           d[n] = h[n - 1];
-          const dn = 0;
-          Object.assign(d, { [0]: d0, [n]: dn });
+          Object.assign(d, { [0]: 0, [n]: 0 });
         } else {
           b[0] = 1;
           c[0] = 0;
@@ -174,17 +245,22 @@ export class CubicSpline implements Curve {
     if (this.segments.length === 0) {
       throw new Error('No segments built');
     }
-    if (t >= 1) {
-      const idx = this.segments.length - 1;
-      const seg = this.segments[idx];
-      return { segment: seg, localT: (t - seg.tStart) / (seg.tEnd - seg.tStart), index: idx };
+
+    let lo = 0, hi = this.segments.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (this.segments[mid].tEnd < t) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
     }
 
-    const n = this.segments.length;
-    const index = Math.min(Math.floor(t * n), n - 1);
-    const seg = this.segments[index];
-    const localT = (t - seg.tStart) / (seg.tEnd - seg.tStart);
-    return { segment: seg, localT, index };
+    const idx = lo;
+    const seg = this.segments[idx];
+    const segSpan = seg.tEnd - seg.tStart;
+    const localT = segSpan > STABILITY_EPSILON ? (t - seg.tStart) / segSpan : 0;
+    return { segment: seg, localT: safeNumber(localT, 0), index: idx };
   }
 
   private evaluatePolynomial(coeff: CubicCoefficients, t: number): number {
@@ -201,34 +277,30 @@ export class CubicSpline implements Curve {
 
   evaluate(t: number): Point {
     const { segment, localT } = this.findSegment(t);
-    const n = this.segments.length;
-    const scaledLocalT = localT;
-    return createPoint(
-      this.evaluatePolynomial(segment.xCoeff, scaledLocalT),
-      this.evaluatePolynomial(segment.yCoeff, scaledLocalT)
-    );
+    return safePoint(createPoint(
+      this.evaluatePolynomial(segment.xCoeff, localT),
+      this.evaluatePolynomial(segment.yCoeff, localT)
+    ));
   }
 
   derivative(t: number): Point {
     const { segment, localT } = this.findSegment(clamp(t, 0, 1));
-    const n = this.segments.length;
-    const scaledLocalT = localT;
-    const dt = 1.0 / n;
-    return createPoint(
-      this.evaluateDerivative(segment.xCoeff, scaledLocalT) / dt,
-      this.evaluateDerivative(segment.yCoeff, scaledLocalT) / dt
-    );
+    const segSpan = segment.tEnd - segment.tStart;
+    const dt = segSpan > STABILITY_EPSILON ? segSpan : 1;
+    return safePoint(createPoint(
+      this.evaluateDerivative(segment.xCoeff, localT) / dt,
+      this.evaluateDerivative(segment.yCoeff, localT) / dt
+    ));
   }
 
   secondDerivative(t: number): Point {
     const { segment, localT } = this.findSegment(clamp(t, 0, 1));
-    const n = this.segments.length;
-    const scaledLocalT = localT;
-    const dt = 1.0 / n;
-    return createPoint(
-      this.evaluateSecondDerivative(segment.xCoeff, scaledLocalT) / (dt * dt),
-      this.evaluateSecondDerivative(segment.yCoeff, scaledLocalT) / (dt * dt)
-    );
+    const segSpan = segment.tEnd - segment.tStart;
+    const dt = segSpan > STABILITY_EPSILON ? segSpan : 1;
+    return safePoint(createPoint(
+      this.evaluateSecondDerivative(segment.xCoeff, localT) / (dt * dt),
+      this.evaluateSecondDerivative(segment.yCoeff, localT) / (dt * dt)
+    ));
   }
 
   sample(count: number): Point[] {
@@ -243,12 +315,32 @@ export class CubicSpline implements Curve {
     return result;
   }
 
+  sampleByTimestamps(timeStamps: number[]): Point[] {
+    if (!this.extendedOptions.timeStamps) {
+      return this.sample(timeStamps.length);
+    }
+    const ts = this.extendedOptions.timeStamps;
+    let minT = Infinity, maxT = -Infinity;
+    for (const t of ts) {
+      if (t < minT) minT = t;
+      if (t > maxT) maxT = t;
+    }
+    const range = maxT - minT;
+    if (range < STABILITY_EPSILON) {
+      return timeStamps.map(() => this.evaluate(0));
+    }
+    return timeStamps.map(t => {
+      const normT = (t - minT) / range;
+      return this.evaluate(normT);
+    });
+  }
+
   arcLength(t0: number = 0, t1: number = 1): number {
-    return this.arcLengthSampler.arcLength(t0, t1);
+    return safeNumber(this.arcLengthSampler.arcLength(t0, t1), 0);
   }
 
   getTotalLength(): number {
-    return this.totalLength;
+    return safeNumber(this.totalLength, 0);
   }
 
   sampleByArcLength(count: number): Point[] {
@@ -272,6 +364,10 @@ export class CubicSpline implements Curve {
     return this.segments.length;
   }
 
+  getAnalyzer(): CurveAnalyzer {
+    return this.analyzer;
+  }
+
   checkContinuity(tolerance: number = 1e-9): {
     position: boolean;
     firstDerivative: boolean;
@@ -283,10 +379,10 @@ export class CubicSpline implements Curve {
     let firstOk = true;
     let secondOk = true;
 
-    for (let i = 1; i < this.controlPoints.length - 1; i++) {
-      const t = i / this.segments.length;
-      const tMinus = t - EPSILON;
-      const tPlus = t + EPSILON;
+    for (let i = 1; i < this.knots.length - 1; i++) {
+      const t = this.knots[i];
+      const tMinus = Math.max(0, t - EPSILON);
+      const tPlus = Math.min(1, t + EPSILON);
 
       const pLeft = this.evaluate(tMinus);
       const pRight = this.evaluate(tPlus);

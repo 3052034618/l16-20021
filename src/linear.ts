@@ -1,20 +1,29 @@
 import { Point, Curve, lerpPoint, distance, createPoint, clamp, EPSILON } from './types';
 import { ArcLengthSampler } from './arc_length';
+import { CurveAnalyzer } from './curve_analyzer';
+import { cleanInputPoints, safePoint, safeNumber, STABILITY_EPSILON } from './stability';
 
 export class LinearInterpolation implements Curve {
   private points: Point[];
   private segmentLengths: number[];
   private totalLength: number;
   private arcLengthSampler: ArcLengthSampler;
+  private analyzer: CurveAnalyzer;
 
   constructor(points: Point[]) {
-    if (points.length < 2) {
-      throw new Error('LinearInterpolation requires at least 2 points');
+    const cleaned = cleanInputPoints(points);
+    if (cleaned.points.length < 2) {
+      throw new Error('LinearInterpolation requires at least 2 valid distinct points');
     }
-    this.points = [...points];
+    this.points = cleaned.points;
     this.segmentLengths = this.computeSegmentLengths();
     this.totalLength = this.segmentLengths.reduce((a, b) => a + b, 0);
     this.arcLengthSampler = new ArcLengthSampler((t) => this.evaluate(t), 1000);
+    this.analyzer = new CurveAnalyzer(
+      (t) => this.evaluate(t),
+      (t) => this.derivative(t),
+      200
+    );
   }
 
   private computeSegmentLengths(): number[] {
@@ -28,6 +37,9 @@ export class LinearInterpolation implements Curve {
   private findSegment(t: number): { index: number; localT: number } {
     t = clamp(t, 0, 1);
     const n = this.points.length - 1;
+    if (t >= 1) {
+      return { index: n - 1, localT: 1 };
+    }
     const scaledT = t * n;
     const index = Math.min(Math.floor(scaledT), n - 1);
     const localT = scaledT - index;
@@ -36,16 +48,15 @@ export class LinearInterpolation implements Curve {
 
   evaluate(t: number): Point {
     const { index, localT } = this.findSegment(t);
-    return lerpPoint(this.points[index], this.points[index + 1], localT);
+    return safePoint(lerpPoint(this.points[index], this.points[index + 1], localT));
   }
 
   derivative(t: number): Point {
     const { index } = this.findSegment(Math.max(0, Math.min(t, 1 - EPSILON)));
     const p0 = this.points[index];
     const p1 = this.points[index + 1];
-    const dx = (p1.x - p0.x) * (this.points.length - 1);
-    const dy = (p1.y - p0.y) * (this.points.length - 1);
-    return createPoint(dx, dy);
+    const n = this.points.length - 1;
+    return safePoint(createPoint((p1.x - p0.x) * n, (p1.y - p0.y) * n));
   }
 
   sample(count: number): Point[] {
@@ -64,11 +75,11 @@ export class LinearInterpolation implements Curve {
     t0 = clamp(t0, 0, 1);
     t1 = clamp(t1, 0, 1);
     if (t0 > t1) [t0, t1] = [t1, t0];
-    return this.arcLengthSampler.arcLength(t0, t1);
+    return safeNumber(this.arcLengthSampler.arcLength(t0, t1), 0);
   }
 
   getTotalLength(): number {
-    return this.totalLength;
+    return safeNumber(this.totalLength, 0);
   }
 
   sampleByArcLength(count: number): Point[] {
@@ -81,5 +92,9 @@ export class LinearInterpolation implements Curve {
 
   getSegmentCount(): number {
     return this.points.length - 1;
+  }
+
+  getAnalyzer(): CurveAnalyzer {
+    return this.analyzer;
   }
 }

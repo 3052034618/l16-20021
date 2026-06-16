@@ -1,7 +1,8 @@
 import {
   Point, createPoint, LinearInterpolation, CubicSpline,
   BezierCurve, CubicBezier, CatmullRomSpline, solveTridiagonal,
-  bernsteinPolynomial, ArcLengthSampler
+  bernsteinPolynomial, ArcLengthSampler, CurveAnalyzer, CurveIO,
+  cleanInputPoints
 } from '../src/index';
 
 function logTitle(title: string): void {
@@ -328,6 +329,135 @@ function testAnimationPath(): void {
   });
 }
 
+function testTimedKnots(): void {
+  logTitle('8. 自定义时间戳 / 非均匀 knots');
+
+  const keyframes: Point[] = [
+    createPoint(0, 0),
+    createPoint(20, 50),
+    createPoint(50, 30),
+    createPoint(100, 80)
+  ];
+  const timestamps = [0, 1, 3, 7];
+
+  console.log('关键帧时间戳:', timestamps);
+  console.log('关键帧位置:');
+  keyframes.forEach((p, i) => console.log(`  t=${timestamps[i]}s: (${p.x}, ${p.y})`));
+
+  const spline = new CubicSpline(keyframes, { timeStamps: timestamps });
+  const knots = spline.getKnots();
+  console.log('\n归一化 knots:', knots.map(k => k.toFixed(3)).join(', '));
+
+  console.log('\n按真实时间采样 (0-7s，每秒):');
+  for (let s = 0; s <= 7; s++) {
+    const p = spline.evaluate(s / 7);
+    console.log(`  t=${s}s: (${p.x.toFixed(1)}, ${p.y.toFixed(1)})`);
+  }
+}
+
+function testCurveAnalysis(): void {
+  logTitle('9. 曲线分析（最近点/曲率/包围盒）');
+
+  const pts: Point[] = [
+    createPoint(0, 0),
+    createPoint(10, 30),
+    createPoint(30, 10),
+    createPoint(50, 50),
+    createPoint(70, 20)
+  ];
+  const cr = new CatmullRomSpline(pts);
+  const analyzer = cr.getAnalyzer() as CurveAnalyzer;
+
+  const bbox = analyzer.getBoundingBox();
+  console.log('包围盒:');
+  console.log(`  X: [${bbox.minX.toFixed(1)}, ${bbox.maxX.toFixed(1)}] (宽=${bbox.width.toFixed(1)})`);
+  console.log(`  Y: [${bbox.minY.toFixed(1)}, ${bbox.maxY.toFixed(1)}] (高=${bbox.height.toFixed(1)})`);
+  console.log(`  中心: (${bbox.center.x.toFixed(1)}, ${bbox.center.y.toFixed(1)})`);
+
+  console.log('\n速度与曲率沿曲线分布 (t=0, 0.25, 0.5, 0.75, 1):');
+  for (const t of [0, 0.25, 0.5, 0.75, 1]) {
+    const spd = analyzer.speed(t);
+    const k = analyzer.curvature(t);
+    const p = cr.evaluate(t);
+    console.log(`  t=${t}: pos=(${p.x.toFixed(1)}, ${p.y.toFixed(1)}), 速度=${spd.toFixed(2)}, 曲率=${k.toFixed(4)}`);
+  }
+
+  const target = createPoint(25, 25);
+  const proj = analyzer.findNearestPoint(target);
+  console.log(`\n最近点查询 (目标点=(${target.x}, ${target.y})):`);
+  console.log(`  最近点: (${proj.point.x.toFixed(2)}, ${proj.point.y.toFixed(2)})`);
+  console.log(`  参数 t: ${proj.parameter.toFixed(4)}, 距离: ${proj.distance.toFixed(3)}`);
+
+  const near = analyzer.isPointNearCurve(target, 5);
+  console.log(`  目标点距曲线<5? ${near.near}`);
+}
+
+function testIO(): void {
+  logTitle('10. 互导（SVG / 贝塞尔拟合）');
+
+  const pts: Point[] = [
+    createPoint(0, 0),
+    createPoint(50, 100),
+    createPoint(150, 50),
+    createPoint(200, 150),
+    createPoint(250, 0)
+  ];
+  const cr = new CatmullRomSpline(pts);
+
+  const svgPath = CurveIO.toSVGPath(cr);
+  console.log('Catmull-Rom SVG path:');
+  console.log('  ' + svgPath);
+
+  const bzSegs = cr.toBezierSegments();
+  const bzSvg = CurveIO.toSVGPath(bzSegs);
+  console.log('\n转换为贝塞尔段后 SVG:');
+  console.log('  ' + bzSvg);
+
+  const samples = cr.sample(50);
+  const fit = CurveIO.fitCubicBezier(samples, { maxError: 1.0 });
+  console.log(`\n从 50 个采样点反拟合贝塞尔:`);
+  console.log(`  段数: ${fit.curves.length}, 最大误差: ${fit.error.toFixed(4)}`);
+
+  const fitSvg = CurveIO.toSVGPath(fit.curves);
+  console.log(`  拟合 SVG path: ${fitSvg.substring(0, 80)}...`);
+
+  const fullSvg = CurveIO.curveToFullSVG(cr, { width: 400, height: 250 });
+  console.log(`\n完整 SVG (600x250): ${fullSvg.length} 字符`);
+}
+
+function testStability(): void {
+  logTitle('11. 数值稳定性测试');
+
+  const duplicated = [
+    createPoint(0, 0), createPoint(0, 0),
+    createPoint(1, 1), createPoint(1, 1),
+    createPoint(2, 0), createPoint(2, 0)
+  ];
+  const cleaned = cleanInputPoints(duplicated);
+  console.log(`去重前 ${duplicated.length} 点 -> 去重后 ${cleaned.points.length} 点`);
+  console.log(`  removedDuplicates: ${cleaned.removedDuplicates}`);
+
+  const allSame = [createPoint(5, 5), createPoint(5, 5), createPoint(5, 5)];
+  const allSameCleaned = cleanInputPoints(allSame);
+  console.log(`全重合点 collapsed: ${allSameCleaned.allCollapsed}`);
+
+  const withNaN = [createPoint(0, 0), createPoint(NaN, Infinity), createPoint(1, 1)];
+  const nanCleaned = cleanInputPoints(withNaN);
+  console.log(`NaN/Infinity 过滤后剩 ${nanCleaned.points.length} 有效点`);
+
+  try {
+    new CubicSpline(cleaned.points);
+    console.log('清洗后 CubicSpline 构建成功 ✓');
+  } catch (e) {
+    console.log('CubicSpline 构建失败:', e);
+  }
+
+  const cr = new CatmullRomSpline([createPoint(0, 0), createPoint(10, 10)]);
+  console.log('2点 CR 曲线构建成功 ✓');
+  console.log(`  t=0: (${cr.evaluate(0).x}, ${cr.evaluate(0).y})`);
+  console.log(`  t=1: (${cr.evaluate(1).x}, ${cr.evaluate(1).y})`);
+}
+
 function main(): void {
   console.log('\n╔══════════════════════════════════════════════════════╗');
   console.log('║       曲线与插值引擎 - 完整演示                    ║');
@@ -340,6 +470,10 @@ function main(): void {
   testCatmullRom();
   testArcLengthSampling();
   testAnimationPath();
+  testTimedKnots();
+  testCurveAnalysis();
+  testIO();
+  testStability();
 
   console.log('\n╔══════════════════════════════════════════════════════╗');
   console.log('║              演示完成！所有功能正常工作                 ║');

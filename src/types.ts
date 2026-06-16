@@ -18,6 +18,7 @@ export interface Curve {
   arcLength(t0?: number, t1?: number): number;
   getTotalLength(): number;
   sampleByArcLength(count: number): Point[];
+  getAnalyzer?(): any;
 }
 
 export interface CubicCoefficients {

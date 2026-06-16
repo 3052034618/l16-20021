@@ -2,7 +2,8 @@ import {
   Point, createPoint, LinearInterpolation, CubicSpline,
   BezierCurve, CubicBezier, CatmullRomSpline, solveTridiagonal,
   verifyTridiagonalSolution, bernsteinPolynomial, binomialCoefficient,
-  ArcLengthSampler, distance
+  ArcLengthSampler, distance, CurveAnalyzer, CurveIO, cleanInputPoints,
+  computeBoundingBox, isFinitePoint, autoKnots, bboxContainsPoint
 } from '../src/index';
 
 let passed = 0;
@@ -272,6 +273,156 @@ testSection('测试 8: 边界与异常情况', () => {
     errorThrown = true;
   }
   assert(errorThrown, '少于2点抛出异常');
+});
+
+testSection('测试 9: 数值稳定性与输入清洗', () => {
+  const ptsWithDup: Point[] = [
+    createPoint(0, 0),
+    createPoint(0, 0),
+    createPoint(1, 1),
+    createPoint(1, 1),
+    createPoint(2, 0)
+  ];
+  const cleaned = cleanInputPoints(ptsWithDup);
+  assert(cleaned.removedDuplicates === true, '重复点被检测');
+  assert(cleaned.points.length === 3, '去重后剩3点');
+  assert(cleaned.originalIndices.length === 3, '原始索引对应');
+
+  const allSame: Point[] = [
+    createPoint(5, 5),
+    createPoint(5, 5),
+    createPoint(5, 5)
+  ];
+  const allSameCleaned = cleanInputPoints(allSame);
+  assert(allSameCleaned.allCollapsed === true, '全重合点标记 collapsed');
+
+  const nanPts: Point[] = [
+    createPoint(0, 0),
+    createPoint(NaN, NaN),
+    createPoint(1, 1)
+  ];
+  const nanCleaned = cleanInputPoints(nanPts);
+  assert(nanCleaned.points.length === 2, 'NaN 点被过滤');
+  assert(isFinitePoint(nanCleaned.points[0]) === true, '剩余点为有限值');
+
+  const bboxPts = [createPoint(0, 0), createPoint(3, 4)];
+  const bbox = computeBoundingBox([createPoint(0, 0), createPoint(3, 4)]);
+  assert(bbox.minX === 0 && bbox.maxX === 3, '包围盒 X 范围正确');
+  assert(bbox.minY === 0 && bbox.maxY === 4, '包围盒 Y 范围正确');
+  assert(bboxContainsPoint(bbox, createPoint(1.5, 2)), '包围盒包含内部点');
+  assert(bboxContainsPoint(bbox, createPoint(10, 10)) === false, '包围盒不包含外部点');
+  assert(bbox.width === 3 && bbox.height === 4, '包围盒宽高正确');
+
+  const knots = autoKnots(5, 'uniform');
+  assert(knots.length === 5, '均匀knots数量正确');
+  assert(knots[0] === 0, '第一个knot=0');
+  assert(Math.abs(knots[4] - 1) < 1e-15, '最后一个knot=1');
+});
+
+testSection('测试 10: 自定义 knots / 时间戳', () => {
+  const pts: Point[] = [
+    createPoint(0, 0),
+    createPoint(1, 2),
+    createPoint(3, 1),
+    createPoint(6, 3)
+  ];
+
+  const uniform = new CubicSpline(pts, { knotType: 'uniform' });
+  const uk = uniform.getKnots();
+  assertApprox(uk[0], 0, 1e-12, 'uniform knots[0]=0');
+  assertApprox(uk[uk.length - 1], 1, 1e-12, 'uniform knots[-1]=1');
+
+  for (let i = 0; i < pts.length; i++) {
+    const t = uk[i];
+    assertPointApprox(uniform.evaluate(t), pts[i], 1e-6, 'custom-knot 经过 P' + i);
+  }
+
+  const chordal = new CubicSpline(pts, { knotType: 'chordal' });
+  const ck = chordal.getKnots();
+  assert(ck[0] === 0 && ck[ck.length - 1] === 1, 'chordal knots 归一化');
+
+  const timestamps = [0, 10, 30, 60];
+  const timeBased = new CubicSpline(pts, { timeStamps: timestamps });
+  const tk = timeBased.getKnots();
+  assertApprox(tk[0], 0, 1e-12, '时间戳归一化 t0=0');
+  assertApprox(tk[1], 10 / 60, 1e-6, '时间戳归一化 t1=1/6');
+  assertApprox(tk[tk.length - 1], 1, 1e-12, '时间戳归一化 tend=1');
+
+  const crTimed = new CatmullRomSpline(pts, { timeStamps: [0, 1, 2, 5] });
+  for (let i = 0; i < pts.length; i++) {
+    const t = crTimed.getKnots()[i];
+    assertPointApprox(crTimed.evaluate(t), pts[i], 1e-6, 'CR 时间戳 P' + i);
+  }
+});
+
+testSection('测试 11: 曲线分析器', () => {
+  const p0 = createPoint(0, 0);
+  const p1 = createPoint(0, 10);
+  const p2 = createPoint(10, 10);
+  const p3 = createPoint(10, 0);
+  const cr = new CatmullRomSpline([p0, p1, p2, p3], { tension: 0.5 });
+  const analyzer = cr.getAnalyzer() as CurveAnalyzer;
+
+  const analysis = analyzer.analyze();
+  assert(analysis.boundingBox.width > 0, '包围盒有宽度');
+  assert(analysis.boundingBox.height > 0, '包围盒有高度');
+  assert(analysis.arcLength > 0, '弧长大于0');
+  assert(analysis.estimatedMaxSpeed >= 0, '最大速度非负');
+
+  const bbox = analyzer.getBoundingBox();
+  assert(bbox.minX <= 0 && bbox.maxX >= 10, 'X范围覆盖');
+  assert(bbox.minY <= 0 && bbox.maxY >= 10, 'Y范围覆盖');
+
+  const speed = analyzer.speed(0.5);
+  assert(speed > 0, 't=0.5 速度>0');
+
+  const target = createPoint(5, 5);
+  const proj = analyzer.findNearestPoint(target);
+  assert(proj.distance < 10, '最近点距离有限');
+  assert(proj.parameter >= 0 && proj.parameter <= 1, '最近点参数在[0,1]');
+
+  const k = analyzer.curvature(0.5);
+  assert(Number.isFinite(k), '曲率是有限值');
+
+  const nearCheck = analyzer.isPointNearCurve(createPoint(5, 5), 20);
+  assert(nearCheck.near === true, '附近点检测');
+  const farCheck = analyzer.isPointNearCurve(createPoint(100, 100), 1);
+  assert(farCheck.near === false, '远处点检测');
+});
+
+testSection('测试 12: SVG 导出与互转', () => {
+  const pts: Point[] = [
+    createPoint(0, 0),
+    createPoint(1, 3),
+    createPoint(2, 1),
+    createPoint(3, 4),
+    createPoint(4, 0)
+  ];
+
+  const cr = new CatmullRomSpline(pts);
+  const svgPath = CurveIO.toSVGPath(cr);
+  assert(svgPath.startsWith('M '), 'SVG path 以 M 开头');
+  assert(svgPath.includes('C '), 'SVG path 包含 C 指令');
+
+  const lin = new LinearInterpolation(pts);
+  const polySvg = CurveIO.toSVGPath(lin.sample(20));
+  assert(polySvg.startsWith('M '), '折线 SVG 以 M 开头');
+
+  const bzSegments = cr.toBezierSegments();
+  const compositeSvg = CurveIO.toSVGPath(bzSegments);
+  assert(compositeSvg.includes('C '), '贝塞尔段 SVG 正确');
+
+  const noisyPts = cr.sample(30);
+  const fit = CurveIO.fitCubicBezier(noisyPts, { maxError: 0.5 });
+  assert(fit.curves.length >= 1, '贝塞尔拟合至少1段');
+  assert(fit.curves[0] instanceof CubicBezier, '拟合结果为 CubicBezier');
+
+  const firstCP = fit.curves[0].getControlPoints();
+  assertPointApprox(firstCP[0], noisyPts[0], 0.5, '拟合起点接近采样起点');
+
+  const fullSvg = CurveIO.curveToFullSVG(cr, { width: 200, height: 150 });
+  assert(fullSvg.includes('<svg'), '完整 SVG 含 svg 标签');
+  assert(fullSvg.includes('<path'), '完整 SVG 含 path 标签');
 });
 
 console.log('\n' + '='.repeat(50));
